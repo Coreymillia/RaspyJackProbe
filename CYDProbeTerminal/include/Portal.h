@@ -11,7 +11,7 @@
 static char     pt_wifi_ssid[64] = "";
 static char     pt_wifi_pass[64] = "";
 static char     pt_pi_ip[64]     = "192.168.0.121";
-static uint16_t pt_pi_port       = 8765;
+static uint16_t pt_pi_port       = 9090;
 static bool     pt_has_settings  = false;
 
 static Preferences _pt_prefs;
@@ -22,7 +22,7 @@ static void ptLoadSettings() {
     strlcpy(pt_wifi_ssid, _pt_prefs.getString("ssid",  "").c_str(),             sizeof(pt_wifi_ssid));
     strlcpy(pt_wifi_pass, _pt_prefs.getString("wpass", "").c_str(),             sizeof(pt_wifi_pass));
     strlcpy(pt_pi_ip,     _pt_prefs.getString("piip",  "192.168.0.121").c_str(), sizeof(pt_pi_ip));
-    pt_pi_port = (uint16_t)_pt_prefs.getUInt("piport", 8765);
+    pt_pi_port = (uint16_t)_pt_prefs.getUInt("piport", 9090);
     _pt_prefs.end();
 }
 
@@ -67,7 +67,7 @@ button{margin-top:20px;width:100%;padding:12px;background:#003322;
 <input name="wpass"  type="password">
 <label>Pi IP Address</label>
 <input name="piip"   value="{PIIP}">
-<label>Pi Event Port (default 8765)</label>
+<label>Pi Event Port (default 9090)</label>
 <input name="piport" type="number" value="{PIPORT}">
 <button type="submit">&#x25B6; Save &amp; Connect</button>
 </form></body></html>

@@ -31,7 +31,7 @@ JOYSTICK_LEFT  = 5    # MITM toggle (inside Bettercap mode)
 
 _PROJECT_DIR  = '/root/RaspyJackProbe'
 _CONFIG_PATH  = os.path.join(_PROJECT_DIR, 'config.json')
-_EVENT_SERVER_PORT = 8765
+_EVENT_SERVER_PORT = 9090
 
 # ── Event broadcaster ────────────────────────────────────────────────────────
 # Shared in-memory ring buffer. Written by any thread, read by the HTTP server.
