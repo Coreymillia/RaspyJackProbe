@@ -29,8 +29,30 @@ JOYSTICK_UP    = 6    # Quick Scan
 JOYSTICK_PRESS = 13   # Settings portal
 JOYSTICK_LEFT  = 5    # MITM toggle (inside Bettercap mode)
 
-_PROJECT_DIR = '/root/RaspyJackProbe'
-_CONFIG_PATH = os.path.join(_PROJECT_DIR, 'config.json')
+_PROJECT_DIR  = '/root/RaspyJackProbe'
+_CONFIG_PATH  = os.path.join(_PROJECT_DIR, 'config.json')
+_EVENT_SERVER_PORT = 8765
+
+# ── Event broadcaster ────────────────────────────────────────────────────────
+# Shared in-memory ring buffer. Written by any thread, read by the HTTP server.
+import collections
+_event_lock   = threading.Lock()
+_event_buffer = collections.deque(maxlen=50)
+_current_mode = 'idle'
+
+
+def _push_event(level: str, msg: str):
+    """level: INFO | ALERT | BC | MODE"""
+    ts = time.strftime('%H:%M:%S')
+    entry = {'ts': ts, 'level': level, 'msg': msg}
+    with _event_lock:
+        _event_buffer.append(entry)
+
+
+def _set_mode(name: str):
+    global _current_mode
+    _current_mode = name
+    _push_event('MODE', f'Mode → {name}')
 
 # ── Font helper ──────────────────────────────────────────────────────────────
 _FONT_PATH_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
@@ -170,6 +192,83 @@ def _check_reboot_hold(lcd, joy_hold_count):
             break
         ju_was = ju
     return 0
+
+
+# ── CYD Event / Command Server ───────────────────────────────────────────────
+# Runs on port 8765 in a daemon thread. Never blocks the main loop.
+#
+#  GET  /status  → {"mode": "...", "device_count": N, "bettercap": bool}
+#  GET  /events  → {"events": [{ts,level,msg}, ...]}  (newest last)
+#  POST /cmd     → {"cmd": "anomaly_detector"|"bettercap"|"quick_scan"|"stop"}
+
+_cmd_queue = []          # pending commands for main loop to consume
+_cmd_lock  = threading.Lock()
+_bc_device_count = 0     # updated by bettercap polling
+
+
+class _CYDHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def _cors(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Type', 'application/json')
+
+    def do_GET(self):
+        if self.path == '/status':
+            with _event_lock:
+                payload = json.dumps({
+                    'mode': _current_mode,
+                    'device_count': _bc_device_count,
+                    'bettercap': _current_mode in ('bettercap', 'mitm'),
+                }).encode()
+            self.send_response(200); self._cors(); self.send_header('Content-Length', len(payload)); self.end_headers()
+            self.wfile.write(payload)
+
+        elif self.path == '/events':
+            with _event_lock:
+                events = list(_event_buffer)
+            payload = json.dumps({'events': events}).encode()
+            self.send_response(200); self._cors(); self.send_header('Content-Length', len(payload)); self.end_headers()
+            self.wfile.write(payload)
+
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_POST(self):
+        if self.path == '/cmd':
+            length = int(self.headers.get('Content-Length', 0))
+            body   = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                cmd  = data.get('cmd', '').strip()
+                if cmd in ('anomaly_detector', 'bettercap', 'quick_scan', 'stop'):
+                    with _cmd_lock:
+                        _cmd_queue.append(cmd)
+                    resp = json.dumps({'ok': True, 'cmd': cmd}).encode()
+                    self.send_response(200)
+                else:
+                    resp = json.dumps({'ok': False, 'error': 'unknown cmd'}).encode()
+                    self.send_response(400)
+            except Exception as e:
+                resp = json.dumps({'ok': False, 'error': str(e)}).encode()
+                self.send_response(400)
+            self._cors(); self.send_header('Content-Length', len(resp)); self.end_headers()
+            self.wfile.write(resp)
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200); self._cors(); self.end_headers()
+
+
+def _start_cyd_server():
+    try:
+        srv = HTTPServer(('0.0.0.0', _EVENT_SERVER_PORT), _CYDHandler)
+        t   = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        print(f'[CYD] event server on :{_EVENT_SERVER_PORT}')
+    except Exception as e:
+        print(f'[CYD] server failed: {e}')
 
 
 # ── Settings portal ───────────────────────────────────────────────────────────
@@ -460,6 +559,7 @@ def _draw_mitm_screen(lcd, target, dns_on, http_proxy_on, local_ip):
 def launch_bettercap(lcd):
     draw_selected(lcd, 'Bettercap', (0, 80, 110))
     time.sleep(0.8)
+    _set_mode('bettercap')
 
     subprocess.run(['systemctl', 'start', 'bettercap.service'],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -484,6 +584,14 @@ def launch_bettercap(lcd):
             result = _bc_fetch()
             if result:
                 iface, modules = result
+                global _bc_device_count
+                try:
+                    req = urllib.request.Request(_BC_API, headers={'Authorization': f'Basic {_BC_AUTH}'})
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        _bc_device_count = len(json.loads(resp.read()).get('endpoints', []))
+                    _push_event('BC', f'BC: {len(modules)} modules, {_bc_device_count} hosts')
+                except Exception:
+                    pass
                 _draw_bettercap_screen(lcd, local_ip, 'running', iface, modules)
             else:
                 _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [])
@@ -517,6 +625,7 @@ def launch_bettercap(lcd):
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     )
                     mitm_on = True
+                    _set_mode('mitm')
                     _draw_mitm_screen(lcd, target, bool(dns_dom), http_proxy, local_ip)
                     print(f'[MITM] started → target={target}')
             else:
@@ -525,6 +634,7 @@ def launch_bettercap(lcd):
                     mitm_proc = None
                 _restore_ip_forward()
                 mitm_on = False
+                _set_mode('bettercap')
                 subprocess.run(['systemctl', 'start', 'bettercap.service'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [])
@@ -547,11 +657,21 @@ def launch_bettercap(lcd):
 def launch_anomaly_detector(lcd):
     draw_selected(lcd, 'Anomaly Det.', (0, 80, 40))
     time.sleep(0.8)
-    # Import here so a missing file doesn't break the menu at boot
+    _set_mode('anomaly_detector')
     sys.path.insert(0, _PROJECT_DIR)
     import anomaly_detector
+    # Patch anomaly_detector's _log so events also go to the CYD buffer
+    _orig_log = anomaly_detector._log
+    def _patched_log(msg):
+        _orig_log(msg)
+        if '[NEW]' in msg:   _push_event('ALERT', msg.strip())
+        elif '[MAC]' in msg: _push_event('ALERT', msg.strip())
+        elif '[SPIKE]' in msg: _push_event('ALERT', msg.strip())
+        elif '[GONE]' in msg:  _push_event('ALERT', msg.strip())
+        elif '[DETECTOR]' in msg: _push_event('INFO', msg.strip())
+    anomaly_detector._log = _patched_log
     anomaly_detector.run(lcd)
-    # run() returns when a KEY is pressed — re-exec back to menu
+    _set_mode('idle')
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
@@ -559,6 +679,7 @@ def launch_anomaly_detector(lcd):
 def launch_raspyjack(lcd):
     draw_selected(lcd, 'RaspyJack', (120, 0, 40))
     time.sleep(0.8)
+    _set_mode('raspyjack')
     _set_ip_forward(True)
     GPIO.cleanup()
     os.execv('/usr/bin/python3', ['python3', '/root/Raspyjack/raspyjack.py'])
@@ -568,6 +689,7 @@ def launch_raspyjack(lcd):
 def launch_quick_scan(lcd):
     draw_selected(lcd, 'Quick Scan', (100, 60, 0))
     time.sleep(0.5)
+    _set_mode('quick_scan')
 
     img  = Image.new('RGB', (128, 128), (0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -587,8 +709,13 @@ def launch_quick_scan(lcd):
         lines = [l for l in result.stdout.splitlines()
                  if l and not l.startswith('Interface') and not l.startswith('Starting')
                  and not l.startswith('Ending') and '\t' in l]
+        _push_event('INFO', f'Quick scan: {len(lines)} hosts found')
+        for ln in lines[:10]:
+            parts = ln.split('\t')
+            _push_event('INFO', f'  {parts[0]}  {parts[1][:17] if len(parts)>1 else ""}')
     except Exception as e:
         lines = [str(e)]
+        _push_event('ALERT', f'Scan error: {e}')
 
     # Display results on LCD
     img  = Image.new('RGB', (128, 128), (0, 0, 0))
@@ -617,6 +744,7 @@ def launch_quick_scan(lcd):
             break
         time.sleep(0.05)
 
+    _set_mode('idle')
     # Return to menu
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -635,6 +763,9 @@ def main():
     lcd.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
     lcd.LCD_Clear()
 
+    _start_cyd_server()
+    _set_mode('idle')
+
     GPIO.setup(KEY1_PIN,       GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(KEY2_PIN,       GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(KEY3_PIN,       GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -648,6 +779,24 @@ def main():
     ju_was = False
 
     while True:
+        # CYD remote commands
+        with _cmd_lock:
+            pending = _cmd_queue.copy()
+            _cmd_queue.clear()
+        for cmd in pending:
+            if cmd == 'anomaly_detector':
+                draw_menu(lcd, selected=1); time.sleep(0.15)
+                launch_anomaly_detector(lcd)
+            elif cmd == 'bettercap':
+                draw_menu(lcd, selected=3); time.sleep(0.15)
+                launch_bettercap(lcd)
+            elif cmd == 'quick_scan':
+                draw_menu(lcd, selected=4); time.sleep(0.15)
+                launch_quick_scan(lcd)
+            elif cmd == 'stop':
+                _set_mode('idle')
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
         if GPIO.input(KEY1_PIN) == GPIO.LOW:
             draw_menu(lcd, selected=1)
             time.sleep(0.25)
