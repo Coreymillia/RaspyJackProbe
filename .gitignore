@@ -1,0 +1,5 @@
+config.json
+known_devices.json
+anomaly.log
+__pycache__/
+*.pyc

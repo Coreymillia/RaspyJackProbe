@@ -1,0 +1,16 @@
+[Unit]
+Description=RaspyJackProbe Boot Mode Selector (Waveshare 1.44" LCD HAT)
+After=local-fs.target sysinit.target dbus.target
+DefaultDependencies=no
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/RaspyJackProbe/mode_selector.py
+User=root
+Environment=PYTHONPATH=/root/Raspyjack
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

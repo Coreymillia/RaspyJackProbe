@@ -1,0 +1,14 @@
+{
+    "_mitm_comment": "Bettercap MITM test settings — configure via the settings portal at :8080. Target should be a device you own (phone/laptop). Toggle MITM on/off with Joystick LEFT while in Bettercap mode.",
+    "mitm_target": "",
+    "mitm_dns_domains": "",
+    "mitm_dns_address": "",
+    "mitm_http_proxy": false,
+
+    "_ip_forward_comment": "Set true to persist net.ipv4.ip_forward=1 across reboots via /etc/sysctl.d/. Needed for NAT, routing, or any feature requiring IP forwarding at all times. MITM mode manages this automatically while active.",
+    "ip_forward_persistent": false,
+
+    "_anomaly_comment": "Anomaly detector settings. poll_interval = seconds between Bettercap scans. spike_threshold = how many NEW devices in one poll triggers a spike alert.",
+    "anomaly_poll_interval": 30,
+    "anomaly_spike_threshold": 3
+}
