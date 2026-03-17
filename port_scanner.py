@@ -229,7 +229,8 @@ def _check_abort(key1, key2, key3):
         return False
 
 
-def _wait_key(key1, key2, key3, timeout=60):
+def _wait_key(key1, key2, key3, timeout=300):
+    """Wait for any key press. Default 5-minute safety timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _check_abort(key1, key2, key3):
@@ -272,16 +273,19 @@ def run(lcd, key1=21, key2=20, key3=16):
             _log('Aborted by user')
             break
 
-        _draw_scanning(lcd, ip, idx - 1, len(hosts))
+        try:
+            _draw_scanning(lcd, ip, idx - 1, len(hosts))
+        except Exception:
+            pass
         _log(f'Scanning {ip} ({idx}/{len(hosts)})')
 
+        open_ports   = []
+        port_banners = []
         try:
             proc = subprocess.run(
                 ['nmap', '-T4', '-F', '--open', '-oG', '-', ip],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, timeout=45
             )
-            open_ports   = []
-            port_banners = []  # defined here so _draw_progress_line always has it
             for line in proc.stdout.splitlines():
                 if 'Ports:' in line:
                     for entry in line.split('Ports:')[1].split(','):
@@ -305,20 +309,25 @@ def run(lcd, key1=21, key2=20, key3=16):
             else:
                 _log(f'{ip}: closed')
 
+        except subprocess.TimeoutExpired:
+            _log(f'{ip}: nmap timeout (skipped)')
+        except Exception as e:
+            _log(f'{ip}: error {e}')
+
+        try:
             _draw_progress_line(
                 lcd, ip, idx, len(hosts),
                 ','.join(str(p) for p, _ in port_banners[:6]) if port_banners else 'closed'
             )
-
-        except subprocess.TimeoutExpired:
-            _log(f'{ip}: timeout (skipped)')
-            _draw_progress_line(lcd, ip, idx, len(hosts), 'timeout')
-        except Exception as e:
-            _log(f'{ip}: error {e}')
+        except Exception:
+            pass
 
         time.sleep(0.1)
 
     _log(f'Done — {len(results)}/{len(hosts)} hosts with open ports, {total_open} total open')
-    _draw_results(lcd, results, len(hosts), total_open)
+    try:
+        _draw_results(lcd, results, len(hosts), total_open)
+    except Exception as e:
+        _log(f'Display error: {e}')
     _wait_key(key1, key2, key3)
 
