@@ -120,7 +120,7 @@ def _get_own_ips():
         return set()
 
 
-
+def _get_hosts_from_bettercap():
     try:
         req = urllib.request.Request(_BC_API, headers={'Authorization': f'Basic {_BC_AUTH}'})
         with urllib.request.urlopen(req, timeout=4) as resp:
