@@ -2,9 +2,10 @@
 """
 RaspyJackProbe — Port Scanner Mode
 Fetches discovered hosts from Bettercap API (or arp-scan fallback),
-runs nmap -T4 -F --open against each, streams results to LCD + CYD event log.
+runs nmap -T4 -F --open against each, grabs service banners, streams
+results to LCD + CYD event log.
 """
-import subprocess, json, time, urllib.request, base64
+import subprocess, json, time, urllib.request, base64, socket, ssl
 import RPi.GPIO as GPIO
 from PIL import Image, ImageDraw, ImageFont
 
@@ -29,6 +30,80 @@ def _log(msg):
     print(f'[PORT_SCAN] {msg}')
     if _push_event:
         _push_event('SCAN', msg.strip())
+
+
+# ── Service banner grab ───────────────────────────────────────────────────────
+_HTTP_PORTS  = {80, 8080, 8081, 8888, 8000, 3000, 5000, 9090, 9000}
+_HTTPS_PORTS = {443, 8443}
+_RAW_PORTS   = {21, 22, 23, 25, 110, 143, 587, 1883, 3306, 5432}
+
+
+def _grab_http(ip, port, use_ssl=False, timeout=2):
+    """Return short Server: header or first title, e.g. 'nginx/1.18' or 'Apache'."""
+    scheme = 'https' if use_ssl else 'http'
+    try:
+        ctx = ssl.create_default_context() if use_ssl else None
+        if use_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+        req = urllib.request.Request(
+            f'{scheme}://{ip}:{port}/',
+            headers={'User-Agent': 'RaspyJackProbe/1.0'}
+        )
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            server = r.headers.get('Server', '')
+            via    = r.headers.get('X-Powered-By', '')
+            if server:
+                return server.split(' ')[0][:24]   # e.g. 'Apache/2.4.54'
+            if via:
+                return via[:24]
+            return 'HTTP/OK'
+    except urllib.error.HTTPError as e:
+        server = e.headers.get('Server', '')
+        return server.split(' ')[0][:24] if server else f'HTTP/{e.code}'
+    except Exception:
+        return ''
+
+
+def _grab_raw(ip, port, timeout=2):
+    """Connect and read the first 128 bytes — works for SSH/FTP/SMTP etc."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            try:
+                data = s.recv(128)
+            except socket.timeout:
+                return ''
+            text = data.decode('utf-8', errors='replace').strip()
+            # Return first non-empty line, truncated
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    return line[:32]
+    except Exception:
+        pass
+    return ''
+
+
+def _banner_grab(ip, port):
+    """Return a short human-readable service string for a known-open port."""
+    if port in _HTTPS_PORTS:
+        return _grab_http(ip, port, use_ssl=True) or 'HTTPS'
+    if port in _HTTP_PORTS:
+        return _grab_http(ip, port, use_ssl=False) or 'HTTP'
+    if port in _RAW_PORTS:
+        banner = _grab_raw(ip, port)
+        if banner:
+            # Clean common prefixes
+            for prefix in ('SSH-', '220 ', '230 ', '+OK ', '* OK'):
+                if banner.startswith(prefix):
+                    return banner[:28]
+            return banner[:28]
+        # Fallback to known port names
+        names = {21:'FTP', 22:'SSH', 23:'Telnet', 25:'SMTP', 110:'POP3',
+                 143:'IMAP', 587:'SMTP', 1883:'MQTT', 3306:'MySQL', 5432:'Postgres'}
+        return names.get(port, '')
+    return ''
 
 
 def _get_hosts_from_bettercap():
@@ -109,16 +184,20 @@ def _draw_results(lcd, results, total_hosts, total_open):
     draw.text((4, 3), f'SCAN DONE  {total_open} open', font=f7, fill=(0, 200, 255))
     y = 18
     if results:
-        for ip, ports in list(results.items())[:6]:
+        for ip, port_banners in list(results.items())[:5]:
             last_octet = ip.rsplit('.', 1)[-1].rjust(3)
-            port_str   = ','.join(str(p) for p in sorted(ports)[:5])
-            if len(ports) > 5:
-                port_str += f'+{len(ports)-5}'
+            # Show up to 3 ports with service abbreviation
+            parts = []
+            for p, banner in port_banners[:3]:
+                svc = banner.split('/')[0][:6] if banner else ''
+                parts.append(f'{p}/{svc}' if svc else str(p))
+            extra = f'+{len(port_banners)-3}' if len(port_banners) > 3 else ''
+            line  = ' '.join(parts) + extra
             draw.text((4, y),   f'.{last_octet}', font=f7, fill=(0, 180, 255))
-            draw.text((32, y),  port_str,          font=f7, fill=(80, 255, 80))
+            draw.text((32, y),  line[:18],         font=f7, fill=(80, 255, 80))
             y += 10
-        if len(results) > 6:
-            draw.text((4, y), f'...+{len(results)-6} more hosts', font=f7, fill=(60, 60, 60))
+        if len(results) > 5:
+            draw.text((4, y), f'...+{len(results)-5} more hosts', font=f7, fill=(60, 60, 60))
     else:
         draw.text((4, 40), 'No open ports found', font=f8, fill=(120, 120, 120))
     draw.text((4, y + 8 if y < 100 else 105),
@@ -167,7 +246,7 @@ def run(lcd, key1=21, key2=20, key3=16):
         return
 
     _log(f'{len(hosts)} hosts via {source}')
-    results    = {}
+    results    = {}   # ip → [(port, banner), ...]
     total_open = 0
 
     for idx, ip in enumerate(hosts, 1):
@@ -195,16 +274,22 @@ def run(lcd, key1=21, key2=20, key3=16):
                                 pass
 
             if open_ports:
-                results[ip] = open_ports
+                port_banners = []
                 total_open += len(open_ports)
                 port_str = ','.join(str(p) for p in sorted(open_ports)[:6])
                 _log(f'{ip}: OPEN {port_str}')
+                for p in sorted(open_ports):
+                    banner = _banner_grab(ip, p)
+                    port_banners.append((p, banner))
+                    if banner:
+                        _log(f'  {ip}:{p} → {banner}')
+                results[ip] = port_banners
             else:
                 _log(f'{ip}: closed')
 
             _draw_progress_line(
                 lcd, ip, idx, len(hosts),
-                ','.join(str(p) for p in sorted(open_ports)[:6]) if open_ports else 'closed'
+                ','.join(str(p) for p, _ in port_banners[:6]) if port_banners else 'closed'
             )
 
         except subprocess.TimeoutExpired:
@@ -218,3 +303,4 @@ def run(lcd, key1=21, key2=20, key3=16):
     _log(f'Done — {len(results)}/{len(hosts)} hosts with open ports, {total_open} total open')
     _draw_results(lcd, results, len(hosts), total_open)
     _wait_key(key1, key2, key3)
+
