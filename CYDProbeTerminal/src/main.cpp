@@ -57,6 +57,7 @@ XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 #define C_ALERT    0xF800   // red
 #define C_BC       0xFFE0   // yellow
 #define C_MODE     0x07FF   // cyan
+#define C_SCAN     0xFD20   // orange
 #define C_DIM      0x2945   // dark grey
 #define C_WHITE    0xFFFF
 #define C_OVERLAY  0x0841   // near-black overlay tint
@@ -75,6 +76,7 @@ static uint16_t levelColor(const char* level) {
     if (strncmp(level, "ALERT", 5) == 0) return C_ALERT;
     if (strncmp(level, "BC",    2) == 0) return C_BC;
     if (strncmp(level, "MODE",  4) == 0) return C_MODE;
+    if (strncmp(level, "SCAN",  4) == 0) return C_SCAN;
     return C_INFO;
 }
 
@@ -154,12 +156,13 @@ struct OvButton {
 };
 
 static OvButton ov_buttons[] = {
-    { "ANOMALY DET",  "anomaly_detector", 0x0320, 10,  40,  140, 42 },
-    { "BETTERCAP",    "bettercap",        0x0059, 165, 40,  145, 42 },
-    { "QUICK SCAN",   "quick_scan",       0x4200, 10,  92,  140, 42 },
-    { "STOP MODE",    "stop",             0x6000, 165, 92,  145, 42 },
+    { "ANOMALY DET",  "anomaly_detector", 0x0320,  10,  40, 140, 36 },
+    { "BETTERCAP",    "bettercap",        0x0059, 165,  40, 145, 36 },
+    { "QUICK SCAN",   "quick_scan",       0x4200,  10,  82, 140, 36 },
+    { "PORT SCAN",    "port_scan",        0x3008, 165,  82, 145, 36 },
+    { "STOP MODE",    "stop",             0x6000,  10, 124, 300, 36 },
 };
-#define N_OV_BUTTONS 4
+#define N_OV_BUTTONS 5
 
 static void drawOverlay() {
     // Semi-transparent tint by filling with a dark color
@@ -187,29 +190,29 @@ static void drawOverlay() {
     }
 
     // Status strip
-    gfx->fillRect(0, 144, W, 28, 0x1082);
+    gfx->fillRect(0, 170, W, 24, 0x1082);
     gfx->setTextColor(C_DIM, 0x1082);
     gfx->setTextSize(1);
     char status[64];
     snprintf(status, sizeof(status), "mode: %-12s  hosts: %d",
              ev_mode, ev_device_count);
-    gfx->setCursor(8, 152);
+    gfx->setCursor(8, 178);
     gfx->print(status);
 
     // X / dismiss button
-    gfx->fillRoundRect(10, 182, 300, 42, 6, 0x2000);
-    gfx->drawRoundRect(10, 182, 300, 42, 6, 0x6000);
+    gfx->fillRoundRect(10, 200, 300, 32, 6, 0x2000);
+    gfx->drawRoundRect(10, 200, 300, 32, 6, 0x6000);
     gfx->setTextColor(0xF800, 0x2000);
     gfx->setTextSize(2);
     int tx = 10 + (300 - 3 * CHAR_W * 2) / 2;
-    gfx->setCursor(tx, 195);
+    gfx->setCursor(tx, 210);
     gfx->print("X  BACK");
 }
 
 // Returns true if overlay should close (X tapped or command sent)
 static bool handleOverlayTouch(int tx, int ty) {
     // X / Back button
-    if (tx >= 10 && tx <= 310 && ty >= 182 && ty <= 224) {
+    if (tx >= 10 && tx <= 310 && ty >= 200 && ty <= 232) {
         return true;
     }
     for (int i = 0; i < N_OV_BUTTONS; i++) {

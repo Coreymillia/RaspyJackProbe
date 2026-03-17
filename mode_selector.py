@@ -26,6 +26,7 @@ KEY1_PIN       = 21   # Anomaly Detector
 KEY2_PIN       = 20   # RaspyJack
 KEY3_PIN       = 16   # Bettercap Monitor
 JOYSTICK_UP    = 6    # Quick Scan
+JOYSTICK_DOWN  = 19   # Port Scanner
 JOYSTICK_PRESS = 13   # Settings portal
 JOYSTICK_LEFT  = 5    # MITM toggle (inside Bettercap mode)
 
@@ -80,17 +81,18 @@ def draw_menu(lcd, selected=None):
         (2, 'KEY2  RaspyJack',      'Security Toolkit',     (180, 0, 60)),
         (3, 'KEY3  Bettercap Mon.', 'Passive Recon+MITM',   (0, 110, 140)),
         (4, 'JOY\u2191  Quick Scan', 'One-shot ARP Sweep',  (100, 60, 0)),
+        (5, 'JOY\u2193  Port Scan',  'nmap All Hosts',      (60, 0, 120)),
     ]
     for i, (num, title, sub, color) in enumerate(modes):
-        y0 = 14 + i * 24
-        y1 = y0 + 22
+        y0 = 14 + i * 19
+        y1 = y0 + 17
         bg = color if selected == num else (30, 30, 30)
         draw.rectangle([(3, y0), (124, y1)], fill=bg, outline=(60, 60, 60))
         draw.text((7, y0 + 2),  title, font=f8, fill=(255, 255, 255))
-        draw.text((7, y0 + 13), sub,   font=f7, fill=(180, 180, 180))
+        draw.text((7, y0 + 11), sub,   font=f7, fill=(180, 180, 180))
 
-    draw.line([(0, 110), (128, 110)], fill=(50, 50, 50))
-    draw.text((4, 113), 'JOY\u25cf  \u2699 Settings Portal', font=f7, fill=(180, 140, 0))
+    draw.line([(0, 111), (128, 111)], fill=(50, 50, 50))
+    draw.text((4, 114), 'JOY\u25cf  \u2699 Settings Portal', font=f7, fill=(180, 140, 0))
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -116,6 +118,27 @@ def _get_local_ip():
         return ip
     except Exception:
         return '?.?.?.?'
+
+
+def _best_iface():
+    """Return best interface for scanning: prefer wired (eth/en) over wireless."""
+    try:
+        out = subprocess.check_output(['ip', '-o', 'addr', 'show'], text=True)
+        eth, wlan = [], []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[2] != 'inet':
+                continue
+            name = parts[1]
+            if name == 'lo':
+                continue
+            if name.startswith(('eth', 'en')):
+                eth.append(name)
+            elif name.startswith(('wlan', 'wl')):
+                wlan.append(name)
+        return eth[0] if eth else (wlan[0] if wlan else None)
+    except Exception:
+        return None
 
 
 def _set_ip_forward(enable: bool):
@@ -241,7 +264,7 @@ class _CYDHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
                 cmd  = data.get('cmd', '').strip()
-                if cmd in ('anomaly_detector', 'bettercap', 'quick_scan', 'stop'):
+                if cmd in ('anomaly_detector', 'bettercap', 'quick_scan', 'port_scan', 'stop'):
                     with _cmd_lock:
                         _cmd_queue.append(cmd)
                     resp = json.dumps({'ok': True, 'cmd': cmd}).encode()
@@ -561,8 +584,19 @@ def launch_bettercap(lcd):
     time.sleep(0.8)
     _set_mode('bettercap')
 
-    subprocess.run(['systemctl', 'start', 'bettercap.service'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Pin to best interface (prefer wired eth over wlan)
+    iface = _best_iface()
+    bc_cmd = ['systemctl', 'start', 'bettercap.service']
+    # bettercap.service doesn't support -iface easily, so start directly if we have an iface
+    if iface:
+        subprocess.Popen(
+            ['/usr/bin/bettercap', '-no-colors', '-iface', iface,
+             '-eval', 'net.probe on; api.rest on'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    else:
+        subprocess.run(['systemctl', 'start', 'bettercap.service'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     dash_proc = subprocess.Popen(
         [sys.executable, _BC_DASH_SCRIPT],
@@ -588,7 +622,7 @@ def launch_bettercap(lcd):
                 try:
                     req = urllib.request.Request(_BC_API, headers={'Authorization': f'Basic {_BC_AUTH}'})
                     with urllib.request.urlopen(req, timeout=3) as resp:
-                        _bc_device_count = len(json.loads(resp.read()).get('endpoints', []))
+                        _bc_device_count = len(json.loads(resp.read()).get('lan', {}).get('hosts', []))
                     _push_event('BC', f'BC: {len(modules)} modules, {_bc_device_count} hosts')
                 except Exception:
                     pass
@@ -749,6 +783,20 @@ def launch_quick_scan(lcd):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+# ── Mode: Port Scanner ────────────────────────────────────────────────────────
+def launch_port_scanner(lcd):
+    draw_selected(lcd, 'Port Scanner', (40, 0, 80))
+    time.sleep(0.8)
+    _set_mode('port_scan')
+    sys.path.insert(0, _PROJECT_DIR)
+    import port_scanner
+    # Bridge scanner events into CYD buffer
+    port_scanner._push_event = _push_event
+    port_scanner.run(lcd, key1=KEY1_PIN, key2=KEY2_PIN, key3=KEY3_PIN)
+    _set_mode('idle')
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     # Restore ip_forward to configured persistent value on startup
@@ -770,6 +818,7 @@ def main():
     GPIO.setup(KEY2_PIN,       GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(KEY3_PIN,       GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(JOYSTICK_UP,    GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(JOYSTICK_DOWN,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(JOYSTICK_PRESS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(JOYSTICK_LEFT,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
@@ -777,6 +826,7 @@ def main():
 
     jp_was = False
     ju_was = False
+    jd_was = False
 
     while True:
         # CYD remote commands
@@ -793,6 +843,9 @@ def main():
             elif cmd == 'quick_scan':
                 draw_menu(lcd, selected=4); time.sleep(0.15)
                 launch_quick_scan(lcd)
+            elif cmd == 'port_scan':
+                draw_menu(lcd, selected=5); time.sleep(0.15)
+                launch_port_scanner(lcd)
             elif cmd == 'stop':
                 _set_mode('idle')
                 os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -818,6 +871,13 @@ def main():
             time.sleep(0.25)
             launch_quick_scan(lcd)
         ju_was = ju
+
+        jd = GPIO.input(JOYSTICK_DOWN) == GPIO.LOW
+        if jd and not jd_was:
+            draw_menu(lcd, selected=5)
+            time.sleep(0.25)
+            launch_port_scanner(lcd)
+        jd_was = jd
 
         jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
         if jp and not jp_was:
