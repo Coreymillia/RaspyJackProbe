@@ -808,7 +808,19 @@ def launch_raspyjack(lcd):
     draw_selected(lcd, 'RaspyJack', (120, 0, 40))
     time.sleep(0.8)
     _set_mode('raspyjack')
-    _set_ip_forward(True)
+
+    # Kill any leftover bettercap/ettercap so they don't appear as "already running"
+    # inside RaspyJack. IP forwarding is managed by RaspyJack itself.
+    for proc_name in ('bettercap', 'ettercap'):
+        try:
+            result = subprocess.run(['pgrep', '-x', proc_name], capture_output=True, text=True)
+            for pid in result.stdout.split():
+                subprocess.run(['kill', pid])
+            if result.stdout.strip():
+                time.sleep(0.5)
+        except Exception:
+            pass
+    _set_ip_forward(False)   # let RaspyJack enable this when it actually needs it
 
     # Release GPIO so raspyjack.py can take it, but keep the event server alive
     GPIO.cleanup()
