@@ -106,7 +106,21 @@ def _banner_grab(ip, port):
     return ''
 
 
-def _get_hosts_from_bettercap():
+def _get_own_ips():
+    """Return set of this device's own IP addresses so we can skip self-scanning."""
+    try:
+        result = subprocess.run(['ip', 'addr', 'show'], capture_output=True, text=True)
+        ips = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('inet ') and not line.startswith('inet 127.'):
+                ips.add(line.split()[1].split('/')[0])
+        return ips
+    except Exception:
+        return set()
+
+
+
     try:
         req = urllib.request.Request(_BC_API, headers={'Authorization': f'Basic {_BC_AUTH}'})
         with urllib.request.urlopen(req, timeout=4) as resp:
@@ -246,6 +260,10 @@ def run(lcd, key1=21, key2=20, key3=16):
         return
 
     _log(f'{len(hosts)} hosts via {source}')
+    own_ips = _get_own_ips()
+    hosts   = [h for h in hosts if h not in own_ips]
+    if own_ips:
+        _log(f'Skipping own IPs: {", ".join(sorted(own_ips))}')
     results    = {}   # ip → [(port, banner), ...]
     total_open = 0
 
@@ -262,7 +280,8 @@ def run(lcd, key1=21, key2=20, key3=16):
                 ['nmap', '-T4', '-F', '--open', '-oG', '-', ip],
                 capture_output=True, text=True, timeout=30
             )
-            open_ports = []
+            open_ports   = []
+            port_banners = []  # defined here so _draw_progress_line always has it
             for line in proc.stdout.splitlines():
                 if 'Ports:' in line:
                     for entry in line.split('Ports:')[1].split(','):
@@ -274,7 +293,6 @@ def run(lcd, key1=21, key2=20, key3=16):
                                 pass
 
             if open_ports:
-                port_banners = []
                 total_open += len(open_ports)
                 port_str = ','.join(str(p) for p in sorted(open_ports)[:6])
                 _log(f'{ip}: OPEN {port_str}')
