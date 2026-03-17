@@ -1,6 +1,7 @@
 [Unit]
 Description=RaspyJackProbe Boot Mode Selector (Waveshare 1.44" LCD HAT)
-After=local-fs.target sysinit.target dbus.target
+After=local-fs.target sysinit.target dbus.target network.target
+Conflicts=raspyjack.service
 DefaultDependencies=no
 
 [Service]
