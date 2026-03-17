@@ -48,13 +48,42 @@ def _font(path, size):
         return ImageFont.load_default()
 
 
+# ── Interface detection ───────────────────────────────────────────────────────
+def _best_iface():
+    """Return the best interface for scanning: prefer wired (eth*) over wireless."""
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(['ip', '-o', 'addr', 'show'], text=True)
+        eth = []
+        wlan = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[2] != 'inet':
+                continue
+            name = parts[1]
+            if name == 'lo':
+                continue
+            if name.startswith('eth') or name.startswith('en'):
+                eth.append(name)
+            elif name.startswith('wlan') or name.startswith('wl'):
+                wlan.append(name)
+        if eth:
+            return eth[0]
+        if wlan:
+            return wlan[0]
+    except Exception:
+        pass
+    return None
+
+
 # ── Recon caplet ──────────────────────────────────────────────────────────────
 def _write_recon_cap():
+    # NOTE: net.recon auto-starts in bettercap v2.32+ when net.probe starts.
+    # Including an explicit 'net.recon on' causes a "already running" error that
+    # aborts the rest of the caplet — so we omit it here.
     lines = [
         'set net.probe.throttle 100',
         'net.probe on',
-        'set net.recon.period 15000',
-        'net.recon on',
         'set api.rest.username user',
         'set api.rest.password pass',
         'set api.rest.port 8081',
@@ -87,7 +116,8 @@ def _bc_fetch():
         )
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read())
-        return data.get('endpoints', [])
+        # bettercap v2.32+ uses lan.hosts, older versions used endpoints
+        return data.get('lan', {}).get('hosts', data.get('endpoints', []))
     except Exception:
         return None
 
@@ -252,10 +282,14 @@ def run(lcd):
     subprocess.run(['systemctl', 'stop', 'bettercap.service'],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.5)
-    bc_proc = subprocess.Popen(
-        ['/usr/bin/bettercap', '-no-colors', '-caplet', _RECON_CAP],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+
+    iface = _best_iface()
+    cmd = ['/usr/bin/bettercap', '-no-colors', '-caplet', _RECON_CAP]
+    if iface:
+        cmd += ['-iface', iface]
+        _log(f'[DETECTOR] using interface {iface}')
+
+    bc_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _log('[DETECTOR] started — waiting for Bettercap API')
     _draw_startup(lcd)
 
