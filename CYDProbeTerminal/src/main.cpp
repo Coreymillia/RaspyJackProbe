@@ -168,24 +168,36 @@ static OvButton ov_buttons[] = {
 };
 #define N_OV_BUTTONS 5
 
+// RaspyJack submenu — shown when Pi mode == "raspyjack"
+static OvButton rj_buttons[] = {
+    { "NET SCAN",     "rj_net_scan",  0x0320,  10,  40, 140, 36 },
+    { "ARP SCAN",     "rj_arp_scan",  0x0059, 165,  40, 145, 36 },
+    { "PORT SCAN",    "rj_port_scan", 0x3008,  10,  82, 140, 36 },
+    { "SHOW LOOT",    "rj_loot",      0x620C, 165,  82, 145, 36 },
+    { "STOP RJ",      "rj_stop",      0x6000,  10, 124, 300, 36 },
+};
+#define N_RJ_BUTTONS 5
+
 static void drawOverlay() {
-    // Semi-transparent tint by filling with a dark color
+    bool is_rj = (strncmp(ev_mode, "raspyjack", 9) == 0);
+    OvButton* btns = is_rj ? rj_buttons : ov_buttons;
+    int       n    = is_rj ? N_RJ_BUTTONS : N_OV_BUTTONS;
+
     gfx->fillRect(0, 0, W, H, C_OVERLAY);
 
     // Title bar
-    gfx->fillRect(0, 0, W, 34, 0x0210);
-    gfx->setTextColor(C_HDR_TXT, 0x0210);
+    gfx->fillRect(0, 0, W, 34, is_rj ? 0x3000 : 0x0210);
+    gfx->setTextColor(is_rj ? C_RJ : C_HDR_TXT, is_rj ? 0x3000 : 0x0210);
     gfx->setTextSize(2);
     gfx->setCursor(8, 8);
-    gfx->print("PROBE CONTROL");
+    gfx->print(is_rj ? "RASPYJACK CTL" : "PROBE CONTROL");
 
     // Buttons
     gfx->setTextSize(1);
-    for (int i = 0; i < N_OV_BUTTONS; i++) {
-        OvButton& b = ov_buttons[i];
+    for (int i = 0; i < n; i++) {
+        OvButton& b = btns[i];
         gfx->fillRoundRect(b.x, b.y, b.w, b.h, 6, b.bg);
         gfx->drawRoundRect(b.x, b.y, b.w, b.h, 6, C_HDR_TXT);
-        // Center text
         int tx = b.x + (b.w - strlen(b.label) * CHAR_W) / 2;
         int ty = b.y + (b.h - 8) / 2;
         gfx->setTextColor(C_WHITE, b.bg);
@@ -219,8 +231,11 @@ static bool handleOverlayTouch(int tx, int ty) {
     if (tx >= 10 && tx <= 310 && ty >= 200 && ty <= 232) {
         return true;
     }
-    for (int i = 0; i < N_OV_BUTTONS; i++) {
-        OvButton& b = ov_buttons[i];
+    bool is_rj = (strncmp(ev_mode, "raspyjack", 9) == 0);
+    OvButton* btns = is_rj ? rj_buttons : ov_buttons;
+    int       n    = is_rj ? N_RJ_BUTTONS : N_OV_BUTTONS;
+    for (int i = 0; i < n; i++) {
+        OvButton& b = btns[i];
         if (tx >= b.x && tx <= b.x + b.w && ty >= b.y && ty <= b.y + b.h) {
             // Flash button
             gfx->fillRoundRect(b.x, b.y, b.w, b.h, 6, C_HDR_TXT);

@@ -224,11 +224,12 @@ def _check_reboot_hold(lcd, joy_hold_count):
 #  GET  /events  → {"events": [{ts,level,msg}, ...]}  (newest last)
 #  POST /cmd     → {"cmd": "anomaly_detector"|"bettercap"|"quick_scan"|"stop"}
 
-_cmd_queue       = []   # pending commands for main loop to consume
+_cmd_queue       = []                # pending commands for main loop to consume
 _cmd_lock        = threading.Lock()
-_bc_device_count = 0    # updated by bettercap polling
-_cpu_snapshot    = None # (idle_ticks, total_ticks) for delta CPU%
-_loot_seen       = {}   # path → mtime, tracks RaspyJack loot changes
+_stop_event      = threading.Event() # set by CYD 'stop'/'rj_stop' to interrupt running modes
+_bc_device_count = 0                 # updated by bettercap polling
+_cpu_snapshot    = None              # (idle_ticks, total_ticks) for delta CPU%
+_loot_seen       = {}                # path → mtime, tracks RaspyJack loot changes
 
 
 class _CYDHandler(BaseHTTPRequestHandler):
@@ -266,9 +267,15 @@ class _CYDHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
                 cmd  = data.get('cmd', '').strip()
-                if cmd in ('anomaly_detector', 'bettercap', 'quick_scan', 'port_scan', 'stop'):
+                _valid = {
+                    'anomaly_detector', 'bettercap', 'quick_scan', 'port_scan',
+                    'stop', 'rj_net_scan', 'rj_arp_scan', 'rj_loot', 'rj_stop', 'rj_port_scan',
+                }
+                if cmd in _valid:
                     with _cmd_lock:
                         _cmd_queue.append(cmd)
+                    if cmd in ('stop', 'rj_stop'):
+                        _stop_event.set()
                     resp = json.dumps({'ok': True, 'cmd': cmd}).encode()
                     self.send_response(200)
                 else:
@@ -798,9 +805,68 @@ def launch_anomaly_detector(lcd):
         elif '[GONE]' in msg:  _push_event('ALERT', msg.strip())
         elif '[DETECTOR]' in msg: _push_event('INFO', msg.strip())
     anomaly_detector._log = _patched_log
-    anomaly_detector.run(lcd)
+    anomaly_detector.run(lcd, stop_event=_stop_event)
     _set_mode('idle')
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ── RaspyJack CYD helpers ─────────────────────────────────────────────────────
+def _get_subnet():
+    """Return /24 subnet string for the best interface, e.g. '192.168.0.0/24'."""
+    import re
+    try:
+        iface = _best_iface()
+        r = subprocess.run(['ip', '-4', 'addr', 'show', iface], capture_output=True, text=True)
+        m = re.search(r'inet (\d+\.\d+\.\d+)\.\d+/(\d+)', r.stdout)
+        if m:
+            return f'{m.group(1)}.0/{m.group(2)}'
+    except Exception:
+        pass
+    return '192.168.0.0/24'
+
+
+def _rj_run_scan(cmd_args, label):
+    """Run a shell scan command, stream each output line as an RJ event."""
+    _push_event('RJ', f'▷ {label}...')
+    try:
+        r = subprocess.run(cmd_args, capture_output=True, text=True, timeout=90)
+        lines = [l.strip() for l in r.stdout.splitlines() if l.strip() and not l.startswith('#')]
+        for ln in lines:
+            _push_event('RJ', ln[:60])
+        if not lines:
+            _push_event('RJ', f'{label}: no results')
+        if r.returncode != 0 and r.stderr.strip():
+            _push_event('RJ', f'err: {r.stderr.strip()[:58]}')
+    except subprocess.TimeoutExpired:
+        _push_event('RJ', f'{label} timed out')
+    except Exception as e:
+        _push_event('RJ', f'{label} error: {e}')
+
+
+def _rj_show_loot():
+    """Push the newest loot file contents as LOOT events to the CYD terminal."""
+    loot_dir = '/root/Raspyjack/loot'
+    try:
+        found = []
+        for root, _, files in os.walk(loot_dir):
+            for f in files:
+                if not f.endswith('.pcap'):
+                    found.append(os.path.join(root, f))
+        found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for fpath in found[:3]:
+            rel = os.path.relpath(fpath, loot_dir)
+            try:
+                with open(fpath) as fh:
+                    lines = [l.rstrip() for l in fh if l.strip()]
+                _push_event('LOOT', f'── {rel} ──')
+                for ln in lines[-8:]:
+                    _push_event('LOOT', ln[:58])
+            except Exception as e:
+                _push_event('LOOT', f'{rel}: {e}')
+        if not found:
+            _push_event('LOOT', 'No loot files found yet')
+    except Exception as e:
+        _push_event('LOOT', f'loot error: {e}')
 
 
 # ── Mode: RaspyJack ──────────────────────────────────────────────────────────
@@ -808,6 +874,7 @@ def launch_raspyjack(lcd):
     draw_selected(lcd, 'RaspyJack', (120, 0, 40))
     time.sleep(0.8)
     _set_mode('raspyjack')
+    _stop_event.clear()
 
     # Kill any leftover bettercap/ettercap so they don't appear as "already running"
     # inside RaspyJack. IP forwarding is managed by RaspyJack itself.
@@ -831,7 +898,6 @@ def launch_raspyjack(lcd):
         text=True, bufsize=1, cwd='/root/Raspyjack'
     )
 
-    # Stream raspyjack stdout → CYD terminal in real time
     _push_event('RJ', '▶ RaspyJack started')
 
     def _stream():
@@ -841,6 +907,40 @@ def launch_raspyjack(lcd):
                 _push_event('RJ', line[:60])
 
     threading.Thread(target=_stream, daemon=True).start()
+
+    def _rj_cmd_consumer():
+        """Process CYD RJ commands while RaspyJack subprocess is running."""
+        while proc.poll() is None:
+            with _cmd_lock:
+                pending = _cmd_queue.copy()
+                _cmd_queue.clear()
+            for c in pending:
+                if c in ('stop', 'rj_stop'):
+                    _push_event('RJ', '■ Stop — terminating RaspyJack')
+                    proc.terminate()
+                    return
+                elif c == 'rj_net_scan':
+                    threading.Thread(
+                        target=_rj_run_scan,
+                        args=(['nmap', '-sn', _get_subnet()], 'NET SCAN'),
+                        daemon=True).start()
+                elif c == 'rj_arp_scan':
+                    iface = _best_iface()
+                    threading.Thread(
+                        target=_rj_run_scan,
+                        args=(['arp-scan', f'--interface={iface}', '--localnet'], 'ARP SCAN'),
+                        daemon=True).start()
+                elif c == 'rj_port_scan':
+                    subnet = _get_subnet()
+                    threading.Thread(
+                        target=_rj_run_scan,
+                        args=(['nmap', '-T4', '-F', '--open', subnet], 'PORT SCAN'),
+                        daemon=True).start()
+                elif c == 'rj_loot':
+                    threading.Thread(target=_rj_show_loot, daemon=True).start()
+            time.sleep(0.5)
+
+    threading.Thread(target=_rj_cmd_consumer, daemon=True).start()
     proc.wait()
 
     _push_event('RJ', f'■ RaspyJack exited (code {proc.returncode})')
@@ -922,7 +1022,7 @@ def launch_port_scanner(lcd):
     import port_scanner
     # Bridge scanner events into CYD buffer
     port_scanner._push_event = _push_event
-    port_scanner.run(lcd, key1=KEY1_PIN, key2=KEY2_PIN, key3=KEY3_PIN)
+    port_scanner.run(lcd, key1=KEY1_PIN, key2=KEY2_PIN, key3=KEY3_PIN, stop_event=_stop_event)
     _set_mode('idle')
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -965,18 +1065,23 @@ def main():
             _cmd_queue.clear()
         for cmd in pending:
             if cmd == 'anomaly_detector':
+                _stop_event.clear()
                 draw_menu(lcd, selected=1); time.sleep(0.15)
                 launch_anomaly_detector(lcd)
             elif cmd == 'bettercap':
+                _stop_event.clear()
                 draw_menu(lcd, selected=3); time.sleep(0.15)
                 launch_bettercap(lcd)
             elif cmd == 'quick_scan':
+                _stop_event.clear()
                 draw_menu(lcd, selected=4); time.sleep(0.15)
                 launch_quick_scan(lcd)
             elif cmd == 'port_scan':
+                _stop_event.clear()
                 draw_menu(lcd, selected=5); time.sleep(0.15)
                 launch_port_scanner(lcd)
             elif cmd == 'stop':
+                _stop_event.clear()
                 _set_mode('idle')
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 

@@ -229,21 +229,27 @@ def _check_abort(key1, key2, key3):
         return False
 
 
-def _wait_key(key1, key2, key3, timeout=300):
-    """Wait for any key press. Default 5-minute safety timeout."""
+def _wait_key(key1, key2, key3, timeout=300, stop_event=None):
+    """Wait for any key press or stop_event. Default 5-minute safety timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _check_abort(key1, key2, key3):
             time.sleep(0.15)
             break
+        if stop_event is not None and stop_event.is_set():
+            break
         time.sleep(0.05)
 
 
-def run(lcd, key1=21, key2=20, key3=16):
+def run(lcd, key1=21, key2=20, key3=16, stop_event=None):
     """
     Entry point called by mode_selector.
     key1/key2/key3 are BCM pin numbers used to abort the scan.
+    stop_event is an optional threading.Event; if set, the scan aborts immediately.
     """
+    def _stopped():
+        return stop_event is not None and stop_event.is_set()
+
     _log('Collecting hosts...')
     _draw_scanning(lcd, 'Collecting...', 0, 1)
 
@@ -257,7 +263,7 @@ def run(lcd, key1=21, key2=20, key3=16):
     if not hosts:
         _log('No hosts found')
         _draw_results(lcd, {}, 0, 0)
-        _wait_key(key1, key2, key3)
+        _wait_key(key1, key2, key3, stop_event=stop_event)
         return
 
     _log(f'{len(hosts)} hosts via {source}')
@@ -269,8 +275,8 @@ def run(lcd, key1=21, key2=20, key3=16):
     total_open = 0
 
     for idx, ip in enumerate(hosts, 1):
-        if _check_abort(key1, key2, key3):
-            _log('Aborted by user')
+        if _check_abort(key1, key2, key3) or _stopped():
+            _log('Aborted by user' if not _stopped() else 'Stopped by CYD')
             break
 
         try:
@@ -329,5 +335,6 @@ def run(lcd, key1=21, key2=20, key3=16):
         _draw_results(lcd, results, len(hosts), total_open)
     except Exception as e:
         _log(f'Display error: {e}')
-    _wait_key(key1, key2, key3)
+    if not _stopped():
+        _wait_key(key1, key2, key3, stop_event=stop_event)
 

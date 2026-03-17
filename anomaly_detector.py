@@ -263,11 +263,13 @@ def _draw_no_api(lcd):
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
-def run(lcd):
+def run(lcd, stop_event=None):
     """
     Called by mode_selector after GPIO is already set up and buttons are configured.
-    Blocks until a KEY is pressed, then returns so the selector can re-exec.
+    Blocks until a KEY is pressed or stop_event is set, then returns.
     """
+    def _stopped():
+        return stop_event is not None and stop_event.is_set()
     try:
         cfg = json.load(open(_CONFIG_PATH))
     except Exception:
@@ -317,7 +319,7 @@ def run(lcd):
     alert_hold = 0  # seconds to keep alert screen up
 
     while True:
-        if _keys_pressed():
+        if _keys_pressed() or _stopped():
             break
 
         endpoints = _bc_fetch()
