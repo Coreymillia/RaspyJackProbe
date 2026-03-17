@@ -58,6 +58,8 @@ XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 #define C_BC       0xFFE0   // yellow
 #define C_MODE     0x07FF   // cyan
 #define C_SCAN     0xFD20   // orange
+#define C_RJ       0xFDA0   // amber  — RaspyJack live output
+#define C_LOOT     0xF81F   // magenta — loot file updates
 #define C_DIM      0x2945   // dark grey
 #define C_WHITE    0xFFFF
 #define C_OVERLAY  0x0841   // near-black overlay tint
@@ -77,6 +79,8 @@ static uint16_t levelColor(const char* level) {
     if (strncmp(level, "BC",    2) == 0) return C_BC;
     if (strncmp(level, "MODE",  4) == 0) return C_MODE;
     if (strncmp(level, "SCAN",  4) == 0) return C_SCAN;
+    if (strncmp(level, "RJ",    2) == 0) return C_RJ;
+    if (strncmp(level, "LOOT",  4) == 0) return C_LOOT;
     return C_INFO;
 }
 

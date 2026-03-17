@@ -224,9 +224,11 @@ def _check_reboot_hold(lcd, joy_hold_count):
 #  GET  /events  → {"events": [{ts,level,msg}, ...]}  (newest last)
 #  POST /cmd     → {"cmd": "anomaly_detector"|"bettercap"|"quick_scan"|"stop"}
 
-_cmd_queue = []          # pending commands for main loop to consume
-_cmd_lock  = threading.Lock()
-_bc_device_count = 0     # updated by bettercap polling
+_cmd_queue       = []   # pending commands for main loop to consume
+_cmd_lock        = threading.Lock()
+_bc_device_count = 0    # updated by bettercap polling
+_cpu_snapshot    = None # (idle_ticks, total_ticks) for delta CPU%
+_loot_seen       = {}   # path → mtime, tracks RaspyJack loot changes
 
 
 class _CYDHandler(BaseHTTPRequestHandler):
@@ -292,6 +294,98 @@ def _start_cyd_server():
         print(f'[CYD] event server on :{_EVENT_SERVER_PORT}')
     except Exception as e:
         print(f'[CYD] server failed: {e}')
+
+    # Start background telemetry threads
+    threading.Thread(target=_sysmon_ticker,  daemon=True).start()
+    threading.Thread(target=_loot_watcher,   daemon=True).start()
+
+
+def _sysmon_ticker():
+    """Push system metrics (CPU/mem/temp/uptime) every 60 seconds."""
+    global _cpu_snapshot
+    time.sleep(15)   # give the system a moment to settle after boot
+    while True:
+        try:
+            # CPU delta from /proc/stat
+            with open('/proc/stat') as f:
+                parts = [int(x) for x in f.readline().split()[1:]]
+            idle  = parts[3] + (parts[4] if len(parts) > 4 else 0)
+            total = sum(parts)
+            if _cpu_snapshot:
+                p_idle, p_total = _cpu_snapshot
+                td = total - p_total
+                cpu_pct = round(100.0 * (1.0 - (idle - p_idle) / td), 1) if td > 0 else 0.0
+            else:
+                cpu_pct = 0.0
+            _cpu_snapshot = (idle, total)
+
+            # Memory from /proc/meminfo
+            mem = {}
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    k, v = line.split(':')
+                    mem[k.strip()] = int(v.strip().split()[0]) * 1024
+            mem_used  = (mem.get('MemTotal', 0) - mem.get('MemAvailable', mem.get('MemFree', 0))) // (1024 * 1024)
+            mem_total = mem.get('MemTotal', 0) // (1024 * 1024)
+
+            # Temperature
+            try:
+                raw  = open('/sys/class/thermal/thermal_zone0/temp').read().strip()
+                temp = float(raw) / 1000.0 if float(raw) > 1000 else float(raw)
+                temp_str = f'{temp:.0f}C'
+            except Exception:
+                temp_str = '?'
+
+            # Uptime
+            uptime_s = int(float(open('/proc/uptime').read().split()[0]))
+            h, r = divmod(uptime_s, 3600)
+            m    = r // 60
+
+            _push_event('INFO', f'SYS cpu:{cpu_pct}% mem:{mem_used}/{mem_total}MB temp:{temp_str} up:{h}h{m}m')
+        except Exception as e:
+            print(f'[sysmon] {e}')
+        time.sleep(60)
+
+
+def _loot_watcher():
+    """Watch /root/Raspyjack/loot/ for new or modified text files, push to CYD."""
+    global _loot_seen
+    _LOOT_DIR    = '/root/Raspyjack/loot'
+    _SKIP_EXT    = {'.pcap', '.pyc', '.gitkeep'}
+    _TEXT_LIMIT  = 10   # max lines to push per change
+
+    time.sleep(20)  # let boot settle
+    while True:
+        try:
+            for root, _, files in os.walk(_LOOT_DIR):
+                for fname in files:
+                    if fname.startswith('.'):
+                        continue
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in _SKIP_EXT:
+                        continue
+                    path = os.path.join(root, fname)
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except Exception:
+                        continue
+                    prev = _loot_seen.get(path)
+                    if prev is None:
+                        _loot_seen[path] = mtime   # first run: mark seen, don't push
+                    elif prev != mtime:
+                        _loot_seen[path] = mtime
+                        try:
+                            rel = os.path.relpath(path, _LOOT_DIR)
+                            with open(path, errors='replace') as f:
+                                lines = [l.rstrip() for l in f.readlines() if l.strip()]
+                            _push_event('LOOT', f'[LOOT] {rel} ({len(lines)} lines)')
+                            for ln in lines[-_TEXT_LIMIT:]:
+                                _push_event('LOOT', f'  {ln[:58]}')
+                        except Exception as e:
+                            _push_event('LOOT', f'[LOOT] {fname}: {e}')
+        except Exception as e:
+            print(f'[loot_watcher] {e}')
+        time.sleep(5)
 
 
 # ── Settings portal ───────────────────────────────────────────────────────────
@@ -715,8 +809,32 @@ def launch_raspyjack(lcd):
     time.sleep(0.8)
     _set_mode('raspyjack')
     _set_ip_forward(True)
+
+    # Release GPIO so raspyjack.py can take it, but keep the event server alive
     GPIO.cleanup()
-    os.execv('/usr/bin/python3', ['python3', '/root/Raspyjack/raspyjack.py'])
+
+    proc = subprocess.Popen(
+        ['/usr/bin/python3', '/root/Raspyjack/raspyjack.py'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, cwd='/root/Raspyjack'
+    )
+
+    # Stream raspyjack stdout → CYD terminal in real time
+    _push_event('RJ', '▶ RaspyJack started')
+
+    def _stream():
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line and not any(line.startswith(p) for p in ('[LCD]', 'GPIO', 'Traceback')):
+                _push_event('RJ', line[:60])
+
+    threading.Thread(target=_stream, daemon=True).start()
+    proc.wait()
+
+    _push_event('RJ', f'■ RaspyJack exited (code {proc.returncode})')
+    _set_mode('idle')
+    # Restart mode_selector to re-init GPIO and LCD
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 # ── Mode: Quick Scan ─────────────────────────────────────────────────────────
