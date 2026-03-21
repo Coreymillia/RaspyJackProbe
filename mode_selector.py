@@ -5,10 +5,12 @@ Displays a mode menu on the Waveshare 1.44" LCD HAT.
 
 KEY1 (BCM 21)      →  Mode 1: Anomaly Detector
 KEY2 (BCM 20)      →  Mode 2: RaspyJack
-KEY3 (BCM 16)      →  Mode 3: Bettercap Monitor (passive + MITM toggle)
+KEY3 (BCM 16)      →  Mode 3: Bettercap Monitor (passive LAN/Wi-Fi + MITM toggle)
 JOY UP (BCM 6)     →  Mode 4: Quick Scan (one-shot ARP → LCD → return)
+JOY LEFT (BCM 5)   →  Mode 5: Wi-Fi Scanner (airodump-ng AP list)
 JOY PRESS (BCM 13) →  Settings Portal
 """
+import re
 import sys, os, time, subprocess, threading, socket, json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, unquote_plus
@@ -28,7 +30,7 @@ KEY3_PIN       = 16   # Bettercap Monitor
 JOYSTICK_UP    = 6    # Quick Scan
 JOYSTICK_DOWN  = 19   # Port Scanner
 JOYSTICK_PRESS = 13   # Settings portal
-JOYSTICK_LEFT  = 5    # MITM toggle (inside Bettercap mode)
+JOYSTICK_LEFT  = 5    # Wi-Fi scanner in menu, MITM toggle inside Bettercap mode
 
 _PROJECT_DIR  = '/root/RaspyJackProbe'
 _CONFIG_PATH  = os.path.join(_PROJECT_DIR, 'config.json')
@@ -82,14 +84,15 @@ def draw_menu(lcd, selected=None):
         (3, 'KEY3  Bettercap Mon.', 'Passive Recon+MITM',   (0, 110, 140)),
         (4, 'JOY\u2191  Quick Scan', 'One-shot ARP Sweep',  (100, 60, 0)),
         (5, 'JOY\u2193  Port Scan',  'nmap All Hosts',      (60, 0, 120)),
+        (6, 'JOY\u2190  WiFi Scan',  '2.4/5 GHz AP List',   (0, 90, 120)),
     ]
     for i, (num, title, sub, color) in enumerate(modes):
-        y0 = 14 + i * 19
-        y1 = y0 + 17
+        y0 = 14 + i * 16
+        y1 = y0 + 14
         bg = color if selected == num else (30, 30, 30)
         draw.rectangle([(3, y0), (124, y1)], fill=bg, outline=(60, 60, 60))
-        draw.text((7, y0 + 2),  title, font=f8, fill=(255, 255, 255))
-        draw.text((7, y0 + 11), sub,   font=f7, fill=(180, 180, 180))
+        draw.text((7, y0 + 1), title, font=f8, fill=(255, 255, 255))
+        draw.text((7, y0 + 8), sub, font=f7, fill=(180, 180, 180))
 
     draw.line([(0, 111), (128, 111)], fill=(50, 50, 50))
     draw.text((4, 114), 'JOY\u25cf  \u2699 Settings Portal', font=f7, fill=(180, 140, 0))
@@ -220,16 +223,41 @@ def _check_reboot_hold(lcd, joy_hold_count):
 # ── CYD Event / Command Server ───────────────────────────────────────────────
 # Runs on port 8765 in a daemon thread. Never blocks the main loop.
 #
-#  GET  /status  → {"mode": "...", "device_count": N, "bettercap": bool}
-#  GET  /events  → {"events": [{ts,level,msg}, ...]}  (newest last)
-#  POST /cmd     → {"cmd": "anomaly_detector"|"bettercap"|"quick_scan"|"stop"}
+#  GET  /status    → {"mode": "...", "device_count": N, "wifi_ap_count": N, "bettercap": bool}
+#  GET  /events    → {"events": [{ts,level,msg}, ...]}  (newest last)
+#  GET  /bettercap → {"interface": "...", "hosts": [...], "wifi_aps": [...], ...}
+#  POST /cmd       → {"cmd": "anomaly_detector"|"raspyjack"|"bettercap"|"quick_scan"|"wifi_scan"|"stop"}
 
 _cmd_queue       = []                # pending commands for main loop to consume
 _cmd_lock        = threading.Lock()
 _stop_event      = threading.Event() # set by CYD 'stop'/'rj_stop' to interrupt running modes
 _bc_device_count = 0                 # updated by bettercap polling
+_bc_wifi_ap_count = 0                # updated by bettercap polling
+_bc_snapshot_lock = threading.Lock()
 _cpu_snapshot    = None              # (idle_ticks, total_ticks) for delta CPU%
 _loot_seen       = {}                # path → mtime, tracks RaspyJack loot changes
+
+
+def _empty_bc_snapshot():
+    return {
+        'interface': '?',
+        'wifi_interface': '',
+        'modules': [],
+        'hosts': [],
+        'wifi_aps': [],
+    }
+
+
+_bc_snapshot = _empty_bc_snapshot()
+
+
+def _set_bc_snapshot(snapshot=None):
+    global _bc_snapshot, _bc_device_count, _bc_wifi_ap_count
+    snap = snapshot or _empty_bc_snapshot()
+    with _bc_snapshot_lock:
+        _bc_snapshot = snap
+    _bc_device_count = len(snap.get('hosts', []))
+    _bc_wifi_ap_count = len(snap.get('wifi_aps', []))
 
 
 class _CYDHandler(BaseHTTPRequestHandler):
@@ -245,6 +273,7 @@ class _CYDHandler(BaseHTTPRequestHandler):
                 payload = json.dumps({
                     'mode': _current_mode,
                     'device_count': _bc_device_count,
+                    'wifi_ap_count': _bc_wifi_ap_count,
                     'bettercap': _current_mode in ('bettercap', 'mitm'),
                 }).encode()
             self.send_response(200); self._cors(); self.send_header('Content-Length', len(payload)); self.end_headers()
@@ -254,6 +283,12 @@ class _CYDHandler(BaseHTTPRequestHandler):
             with _event_lock:
                 events = list(_event_buffer)
             payload = json.dumps({'events': events}).encode()
+            self.send_response(200); self._cors(); self.send_header('Content-Length', len(payload)); self.end_headers()
+            self.wfile.write(payload)
+
+        elif self.path == '/bettercap':
+            with _bc_snapshot_lock:
+                payload = json.dumps(_bc_snapshot).encode()
             self.send_response(200); self._cors(); self.send_header('Content-Length', len(payload)); self.end_headers()
             self.wfile.write(payload)
 
@@ -268,7 +303,7 @@ class _CYDHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 cmd  = data.get('cmd', '').strip()
                 _valid = {
-                    'anomaly_detector', 'bettercap', 'quick_scan', 'port_scan',
+                    'anomaly_detector', 'raspyjack', 'bettercap', 'quick_scan', 'port_scan', 'wifi_scan',
                     'stop', 'rj_net_scan', 'rj_arp_scan', 'rj_loot', 'rj_stop', 'rj_port_scan',
                 }
                 if cmd in _valid:
@@ -577,7 +612,112 @@ def launch_settings_portal(lcd):
 _BC_API  = 'http://localhost:8081/api/session'
 _BC_AUTH = base64.b64encode(b'user:pass').decode()
 _BC_DASH_SCRIPT = os.path.join(_PROJECT_DIR, 'bc_dashboard.py')
+_BC_PASSIVE_CAP = '/tmp/probe-passive.cap'
 _MITM_CAP = '/tmp/probe-mitm.cap'
+_AIRMON_BIN = '/usr/sbin/airmon-ng'
+_NMCLI_BIN  = '/usr/bin/nmcli'
+
+
+def _wireless_ifaces():
+    try:
+        out = subprocess.check_output(['ip', '-o', 'link', 'show'], text=True)
+        ifaces = []
+        for line in out.splitlines():
+            parts = line.split(':', 2)
+            if len(parts) < 2:
+                continue
+            name = parts[1].strip()
+            if (name != 'lo' and
+                name.startswith(('wlan', 'wl')) and
+                not name.endswith('mon')):
+                ifaces.append(name)
+        return ifaces
+    except Exception:
+        return []
+
+
+def _best_wifi_iface(primary_iface=None):
+    """Prefer a secondary wireless interface for passive Wi-Fi recon."""
+    try:
+        out = subprocess.check_output(['ip', '-o', '-4', 'addr', 'show'], text=True)
+        with_ipv4 = {
+            line.split()[1]
+            for line in out.splitlines()
+            if len(line.split()) >= 4 and line.split()[2] == 'inet'
+        }
+    except Exception:
+        with_ipv4 = set()
+
+    candidates = [iface for iface in _wireless_ifaces() if iface != primary_iface]
+    if not candidates:
+        return None
+
+    no_ipv4 = [iface for iface in candidates if iface not in with_ipv4]
+    return (no_ipv4 or candidates)[0]
+
+
+def _existing_monitor_iface():
+    try:
+        out = subprocess.check_output(['ip', '-o', 'link', 'show'], text=True)
+        monitors = []
+        for line in out.splitlines():
+            parts = line.split(':', 2)
+            if len(parts) < 2:
+                continue
+            name = parts[1].strip()
+            if name.startswith(('wlan', 'wl')) and name.endswith('mon'):
+                monitors.append(name)
+        return monitors[0] if monitors else None
+    except Exception:
+        return None
+
+
+def _ipv4_sort_key(value):
+    try:
+        return [int(part) for part in value.split('.')]
+    except Exception:
+        return [999, 999, 999, 999]
+
+
+def _normalize_hosts(hosts, limit=32):
+    items = []
+    for host in hosts or []:
+        ip = (host.get('ipv4') or '').strip()
+        mac = (host.get('mac') or '').strip().lower()
+        if not ip and not mac:
+            continue
+        items.append({
+            'ipv4': ip,
+            'mac': mac,
+            'hostname': (host.get('hostname') or '').strip(),
+            'vendor': (host.get('vendor') or '').strip(),
+        })
+    items.sort(key=lambda item: _ipv4_sort_key(item.get('ipv4', '')))
+    return items[:limit]
+
+
+def _normalize_wifi_aps(aps, limit=32):
+    items = []
+    for ap in aps or []:
+        essid = (ap.get('hostname') or ap.get('alias') or '').strip()
+        enc = (ap.get('encryption') or '').strip()
+        cipher = (ap.get('cipher') or '').strip()
+        auth = (ap.get('authentication') or '').strip()
+        if enc and cipher:
+            security = f'{enc}/{cipher}'
+        elif enc and auth:
+            security = f'{enc}/{auth}'
+        else:
+            security = enc or auth or 'OPEN'
+        items.append({
+            'essid': essid,
+            'bssid': (ap.get('mac') or '').strip().lower(),
+            'channel': ap.get('channel') or 0,
+            'rssi': ap.get('rssi') or 0,
+            'security': security,
+        })
+    items.sort(key=lambda item: (item.get('rssi', -999), item.get('essid', '')), reverse=True)
+    return items[:limit]
 
 
 def _bc_fetch():
@@ -587,11 +727,123 @@ def _bc_fetch():
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
-        iface   = data.get('interface', {}).get('name', '?')
+        iface   = data.get('interface', {}).get('name') or '?'
         modules = [m['name'] for m in data.get('modules', []) if m.get('running')]
-        return iface, modules
+        hosts   = _normalize_hosts(data.get('lan', {}).get('hosts', []))
+        wifi_aps = _normalize_wifi_aps(data.get('wifi', {}).get('aps', []))
+        return {
+            'iface': iface,
+            'modules': modules,
+            'hosts': hosts,
+            'wifi_aps': wifi_aps,
+            'host_count': len(hosts),
+            'wifi_ap_count': len(wifi_aps),
+        }
     except Exception:
         return None
+
+
+def _write_passive_cap(wifi_iface=None):
+    lines = [
+        'set net.probe.throttle 100',
+        'net.probe on',
+        'set api.rest.username user',
+        'set api.rest.password pass',
+        'set api.rest.port 8081',
+        'set api.rest.address 0.0.0.0',
+        'set api.rest.websocket true',
+        'api.rest on',
+    ]
+    if wifi_iface:
+        lines += [
+            f'set wifi.interface {wifi_iface}',
+            'wifi.recon on',
+        ]
+    with open(_BC_PASSIVE_CAP, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def _start_monitor_iface(wifi_iface):
+    if not wifi_iface:
+        return None, None
+    if not os.path.exists(_AIRMON_BIN):
+        return None, 'airmon-ng not installed'
+
+    if os.path.exists(_NMCLI_BIN):
+        subprocess.run(
+            [_NMCLI_BIN, 'device', 'set', wifi_iface, 'managed', 'no'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    result = subprocess.run(
+        [_AIRMON_BIN, 'start', wifi_iface],
+        capture_output=True,
+        text=True,
+    )
+    output = '\n'.join(part for part in (result.stdout, result.stderr) if part).strip()
+
+    mon_iface = None
+    match = re.search(r'on \[phy\d+\](\S+)', output)
+    if match:
+        mon_iface = match.group(1)
+    elif os.path.exists(f'/sys/class/net/{wifi_iface}mon'):
+        mon_iface = f'{wifi_iface}mon'
+
+    if mon_iface and os.path.exists(f'/sys/class/net/{mon_iface}'):
+        return mon_iface, None
+
+    if output:
+        return None, output.splitlines()[-1]
+    return None, f'could not enable monitor mode on {wifi_iface}'
+
+
+def _stop_monitor_iface(monitor_iface, wifi_iface):
+    if not wifi_iface and monitor_iface and monitor_iface.endswith('mon'):
+        wifi_iface = monitor_iface[:-3]
+    if monitor_iface and os.path.exists(_AIRMON_BIN):
+        subprocess.run(
+            [_AIRMON_BIN, 'stop', monitor_iface],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    if wifi_iface and os.path.exists(_NMCLI_BIN):
+        subprocess.run(
+            [_NMCLI_BIN, 'device', 'set', wifi_iface, 'managed', 'yes'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _terminate_proc(proc):
+    if not proc:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _start_bettercap_passive():
+    primary_iface = _best_iface()
+    monitor_iface = _existing_monitor_iface()
+    wifi_iface = monitor_iface[:-3] if monitor_iface and monitor_iface.endswith('mon') else None
+    wifi_error = None
+    if not monitor_iface:
+        wifi_iface = _best_wifi_iface(primary_iface)
+        monitor_iface, wifi_error = _start_monitor_iface(wifi_iface)
+    _write_passive_cap(monitor_iface)
+
+    subprocess.run(['systemctl', 'stop', 'bettercap.service'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    cmd = ['/usr/bin/bettercap', '-no-colors']
+    if primary_iface:
+        cmd += ['-iface', primary_iface]
+    cmd += ['-caplet', _BC_PASSIVE_CAP]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return proc, primary_iface, wifi_iface, monitor_iface, wifi_error
 
 
 def _generate_mitm_cap(target, dns_domains, dns_address, local_ip, http_proxy=False):
@@ -626,7 +878,7 @@ def _generate_mitm_cap(target, dns_domains, dns_address, local_ip, http_proxy=Fa
         f.write('\n'.join(lines) + '\n')
 
 
-def _draw_bettercap_screen(lcd, local_ip, status, iface, modules):
+def _draw_bettercap_screen(lcd, local_ip, status, iface, modules, wifi_iface=None, wifi_ap_count=0):
     img  = Image.new('RGB', (128, 128), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     f8b  = _font(_FONT_PATH_BOLD, 8)
@@ -639,6 +891,8 @@ def _draw_bettercap_screen(lcd, local_ip, status, iface, modules):
 
     y = 18
     draw.text((4, y), f'IF: {iface}', font=f8, fill=(150, 200, 255)); y += 12
+    wifi_text = f'WiFi: {wifi_iface}  APs: {wifi_ap_count}' if wifi_iface else 'WiFi: passive off'
+    draw.text((4, y), wifi_text[:27], font=f7, fill=(255, 190, 80)); y += 10
     draw.line([(0, y), (128, y)], fill=(40, 40, 40)); y += 4
 
     if modules:
@@ -685,19 +939,7 @@ def launch_bettercap(lcd):
     time.sleep(0.8)
     _set_mode('bettercap')
 
-    # Pin to best interface (prefer wired eth over wlan)
-    iface = _best_iface()
-    bc_cmd = ['systemctl', 'start', 'bettercap.service']
-    # bettercap.service doesn't support -iface easily, so start directly if we have an iface
-    if iface:
-        subprocess.Popen(
-            ['/usr/bin/bettercap', '-no-colors', '-iface', iface,
-             '-eval', 'net.probe on; api.rest on'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    else:
-        subprocess.run(['systemctl', 'start', 'bettercap.service'],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    bc_proc, _, wifi_iface, monitor_iface, wifi_error = _start_bettercap_passive()
 
     dash_proc = subprocess.Popen(
         [sys.executable, _BC_DASH_SCRIPT],
@@ -707,7 +949,11 @@ def launch_bettercap(lcd):
     local_ip  = _get_local_ip()
     mitm_proc = None
     mitm_on   = False
-    _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [])
+    wifi_label = monitor_iface or wifi_iface
+    if wifi_error:
+        _push_event('BC', f'WiFi recon unavailable: {wifi_error}')
+    _set_bc_snapshot({'interface': '?', 'wifi_interface': wifi_label or '', 'modules': [], 'hosts': [], 'wifi_aps': []})
+    _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [], wifi_label, 0)
 
     k1w = k2w = k3w = jlw = False
     joy_hold = 0
@@ -718,18 +964,26 @@ def launch_bettercap(lcd):
         if not mitm_on:
             result = _bc_fetch()
             if result:
-                iface, modules = result
-                global _bc_device_count
-                try:
-                    req = urllib.request.Request(_BC_API, headers={'Authorization': f'Basic {_BC_AUTH}'})
-                    with urllib.request.urlopen(req, timeout=3) as resp:
-                        _bc_device_count = len(json.loads(resp.read()).get('lan', {}).get('hosts', []))
-                    _push_event('BC', f'BC: {len(modules)} modules, {_bc_device_count} hosts')
-                except Exception:
-                    pass
-                _draw_bettercap_screen(lcd, local_ip, 'running', iface, modules)
+                iface = result['iface']
+                modules = result['modules']
+                global _bc_device_count, _bc_wifi_ap_count
+                _bc_device_count = result['host_count']
+                _bc_wifi_ap_count = result['wifi_ap_count']
+                _set_bc_snapshot({
+                    'interface': iface,
+                    'wifi_interface': wifi_label or '',
+                    'modules': modules,
+                    'hosts': result['hosts'],
+                    'wifi_aps': result['wifi_aps'],
+                })
+                summary = f'BC: {len(modules)} modules, {_bc_device_count} hosts'
+                if wifi_label:
+                    summary += f', {_bc_wifi_ap_count} APs'
+                _push_event('BC', summary)
+                _draw_bettercap_screen(lcd, local_ip, 'running', iface, modules, wifi_label, _bc_wifi_ap_count)
             else:
-                _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [])
+                _set_bc_snapshot({'interface': '?', 'wifi_interface': wifi_label or '', 'modules': [], 'hosts': [], 'wifi_aps': []})
+                _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [], wifi_label, 0)
 
         k1 = GPIO.input(KEY1_PIN)       == GPIO.LOW
         k2 = GPIO.input(KEY2_PIN)       == GPIO.LOW
@@ -750,6 +1004,11 @@ def launch_bettercap(lcd):
                 dns_addr   = cfg.get('mitm_dns_address', '').strip()
                 http_proxy = cfg.get('mitm_http_proxy', False)
                 if target:
+                    _terminate_proc(bc_proc)
+                    _stop_monitor_iface(monitor_iface, wifi_iface)
+                    bc_proc = None
+                    monitor_iface = None
+                    _set_bc_snapshot()
                     subprocess.run(['systemctl', 'stop', 'bettercap.service'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     time.sleep(1)
@@ -765,21 +1024,26 @@ def launch_bettercap(lcd):
                     print(f'[MITM] started → target={target}')
             else:
                 if mitm_proc:
-                    mitm_proc.terminate()
+                    _terminate_proc(mitm_proc)
                     mitm_proc = None
                 _restore_ip_forward()
                 mitm_on = False
                 _set_mode('bettercap')
-                subprocess.run(['systemctl', 'start', 'bettercap.service'],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [])
+                bc_proc, _, wifi_iface, monitor_iface, wifi_error = _start_bettercap_passive()
+                wifi_label = monitor_iface or wifi_iface
+                if wifi_error:
+                    _push_event('BC', f'WiFi recon unavailable: {wifi_error}')
+                _set_bc_snapshot({'interface': '?', 'wifi_interface': wifi_label or '', 'modules': [], 'hosts': [], 'wifi_aps': []})
+                _draw_bettercap_screen(lcd, local_ip, 'starting', '?', [], wifi_label, 0)
                 print('[MITM] stopped — back to passive recon')
 
         if (k1 and not k1w) or (k2 and not k2w) or (k3 and not k3w):
-            if mitm_proc:
-                mitm_proc.terminate()
+            _terminate_proc(mitm_proc)
+            _terminate_proc(bc_proc)
+            _stop_monitor_iface(monitor_iface, wifi_iface)
+            _set_bc_snapshot()
             _restore_ip_forward()
-            dash_proc.terminate()
+            _terminate_proc(dash_proc)
             subprocess.run(['systemctl', 'stop', 'bettercap.service'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1027,6 +1291,27 @@ def launch_port_scanner(lcd):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def launch_wifi_scanner(lcd):
+    global _bc_device_count, _bc_wifi_ap_count
+    draw_selected(lcd, 'WiFi Scan', (0, 80, 110))
+    time.sleep(0.8)
+    _stop_event.clear()
+    _set_mode('wifi_scan')
+    _bc_device_count = 0
+    _bc_wifi_ap_count = 0
+    _set_bc_snapshot()
+    sys.path.insert(0, _PROJECT_DIR)
+    import wifi_scanner
+    def _update_wifi_status(ap_count):
+        global _bc_wifi_ap_count
+        _bc_wifi_ap_count = ap_count
+    wifi_scanner._push_event = _push_event
+    wifi_scanner._status_update = _update_wifi_status
+    wifi_scanner.run(lcd, key1=KEY1_PIN, key2=KEY2_PIN, key3=KEY3_PIN, stop_event=_stop_event)
+    _set_mode('idle')
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     # Restore ip_forward to configured persistent value on startup
@@ -1054,9 +1339,12 @@ def main():
 
     draw_menu(lcd)
 
-    jp_was = False
-    ju_was = False
-    jd_was = False
+    # Seed edge-tracking from the live pin state so a held/noisy joystick
+    # signal right after restart does not immediately trigger a mode.
+    jp_was = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
+    ju_was = GPIO.input(JOYSTICK_UP) == GPIO.LOW
+    jd_was = GPIO.input(JOYSTICK_DOWN) == GPIO.LOW
+    jl_was = GPIO.input(JOYSTICK_LEFT) == GPIO.LOW
 
     while True:
         # CYD remote commands
@@ -1068,6 +1356,10 @@ def main():
                 _stop_event.clear()
                 draw_menu(lcd, selected=1); time.sleep(0.15)
                 launch_anomaly_detector(lcd)
+            elif cmd == 'raspyjack':
+                _stop_event.clear()
+                draw_menu(lcd, selected=2); time.sleep(0.15)
+                launch_raspyjack(lcd)
             elif cmd == 'bettercap':
                 _stop_event.clear()
                 draw_menu(lcd, selected=3); time.sleep(0.15)
@@ -1080,6 +1372,10 @@ def main():
                 _stop_event.clear()
                 draw_menu(lcd, selected=5); time.sleep(0.15)
                 launch_port_scanner(lcd)
+            elif cmd == 'wifi_scan':
+                _stop_event.clear()
+                draw_menu(lcd, selected=6); time.sleep(0.15)
+                launch_wifi_scanner(lcd)
             elif cmd == 'stop':
                 _stop_event.clear()
                 _set_mode('idle')
@@ -1113,6 +1409,13 @@ def main():
             time.sleep(0.25)
             launch_port_scanner(lcd)
         jd_was = jd
+
+        jl = GPIO.input(JOYSTICK_LEFT) == GPIO.LOW
+        if jl and not jl_was:
+            draw_menu(lcd, selected=6)
+            time.sleep(0.25)
+            launch_wifi_scanner(lcd)
+        jl_was = jl
 
         jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
         if jp and not jp_was:

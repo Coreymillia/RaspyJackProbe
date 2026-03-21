@@ -3,3 +3,7 @@ known_devices.json
 anomaly.log
 __pycache__/
 *.pyc
+CYDProbeTerminal/.pio/
+*.pcap
+*.csv
+*.log

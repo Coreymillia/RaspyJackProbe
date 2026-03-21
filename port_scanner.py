@@ -120,21 +120,58 @@ def _get_own_ips():
         return set()
 
 
+def _best_iface():
+    try:
+        result = subprocess.run(['ip', '-o', '-4', 'addr', 'show'], capture_output=True, text=True)
+        eth = []
+        wlan = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[2] != 'inet':
+                continue
+            name = parts[1]
+            if name == 'lo':
+                continue
+            if name.startswith(('eth', 'en')):
+                eth.append(name)
+            elif name.startswith(('wlan', 'wl')):
+                wlan.append(name)
+        return eth[0] if eth else (wlan[0] if wlan else None)
+    except Exception:
+        return None
+
+
+def _dedupe_hosts(hosts):
+    seen = set()
+    ordered = []
+    for ip in hosts:
+        ip = ip.strip()
+        if ip and ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    return ordered
+
+
 def _get_hosts_from_bettercap():
     try:
         req = urllib.request.Request(_BC_API, headers={'Authorization': f'Basic {_BC_AUTH}'})
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read())
         hosts = data.get('lan', {}).get('hosts', data.get('endpoints', []))
-        return [h['ipv4'] for h in hosts if h.get('ipv4')]
+        return _dedupe_hosts([h['ipv4'] for h in hosts if h.get('ipv4')])
     except Exception:
         return []
 
 
 def _get_hosts_from_arpscan():
     try:
+        iface = _best_iface()
+        cmd = ['arp-scan']
+        if iface:
+            cmd.append(f'--interface={iface}')
+        cmd += ['--localnet', '--retry=2']
         result = subprocess.run(
-            ['arp-scan', '--localnet', '--retry=2'],
+            cmd,
             capture_output=True, text=True, timeout=20
         )
         ips = []
@@ -144,7 +181,7 @@ def _get_hosts_from_arpscan():
                 ip = parts[0].strip()
                 if ip.count('.') == 3:
                     ips.append(ip)
-        return ips
+        return _dedupe_hosts(ips)
     except Exception:
         return []
 
@@ -271,6 +308,7 @@ def run(lcd, key1=21, key2=20, key3=16, stop_event=None):
     hosts   = [h for h in hosts if h not in own_ips]
     if own_ips:
         _log(f'Skipping own IPs: {", ".join(sorted(own_ips))}')
+    _log(f'{len(hosts)} unique targets queued')
     results    = {}   # ip → [(port, banner), ...]
     total_open = 0
 
@@ -337,4 +375,3 @@ def run(lcd, key1=21, key2=20, key3=16, stop_event=None):
         _log(f'Display error: {e}')
     if not _stopped():
         _wait_key(key1, key2, key3, stop_event=stop_event)
-

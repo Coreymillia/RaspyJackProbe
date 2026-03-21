@@ -12,7 +12,7 @@
  *   - Yellow = BC     (bettercap updates)
  *   - Cyan   = MODE   (mode changes)
  *
- * Tap anywhere → control overlay (4 command buttons + status + X to dismiss).
+ * Tap anywhere → control overlay, or Bettercap detail tabs while in Bettercap mode.
  * Buttons POST /cmd to Pi event server on port 8765.
  */
 
@@ -142,8 +142,9 @@ static void drawHeader() {
 
     // Right: device count + wifi
     char right[32];
-    snprintf(right, sizeof(right), "hosts:%d  %s",
+    snprintf(right, sizeof(right), "h:%d ap:%d %s",
              ev_device_count,
+             ev_wifi_ap_count,
              (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "no wifi");
     gfx->setCursor(W - strlen(right) * CHAR_W - 4, 5);
     gfx->print(right);
@@ -151,6 +152,12 @@ static void drawHeader() {
 
 // ── Control overlay ───────────────────────────────────────────────────────────
 static bool overlay_visible = false;
+enum BettercapView { BC_VIEW_SUMMARY, BC_VIEW_HOSTS, BC_VIEW_WIFI };
+static BettercapView bc_view = BC_VIEW_SUMMARY;
+static int bc_host_page = 0;
+static int bc_wifi_page = 0;
+#define BC_HOSTS_PER_PAGE 5
+#define BC_APS_PER_PAGE   5
 
 struct OvButton {
     const char* label;
@@ -160,13 +167,15 @@ struct OvButton {
 };
 
 static OvButton ov_buttons[] = {
-    { "ANOMALY DET",  "anomaly_detector", 0x0320,  10,  40, 140, 36 },
-    { "BETTERCAP",    "bettercap",        0x0059, 165,  40, 145, 36 },
-    { "QUICK SCAN",   "quick_scan",       0x4200,  10,  82, 140, 36 },
-    { "PORT SCAN",    "port_scan",        0x3008, 165,  82, 145, 36 },
+    { "ANOMALY",      "anomaly_detector", 0x0320,  10,  40,  96, 34 },
+    { "RASPYJACK",    "raspyjack",        0x620C, 112,  40,  96, 34 },
+    { "BETTERCAP",    "bettercap",        0x0059, 214,  40,  96, 34 },
+    { "WIFI SCAN",    "wifi_scan",        0x0410,  10,  80,  96, 34 },
+    { "QUICK SCAN",   "quick_scan",       0x4200, 112,  80,  96, 34 },
+    { "PORT SCAN",    "port_scan",        0x3008, 214,  80,  96, 34 },
     { "STOP MODE",    "stop",             0x6000,  10, 124, 300, 36 },
 };
-#define N_OV_BUTTONS 5
+#define N_OV_BUTTONS 7
 
 // RaspyJack submenu — shown when Pi mode == "raspyjack"
 static OvButton rj_buttons[] = {
@@ -178,7 +187,206 @@ static OvButton rj_buttons[] = {
 };
 #define N_RJ_BUTTONS 5
 
+static bool isBettercapMode() {
+    return (strncmp(ev_mode, "bettercap", 9) == 0) || (strncmp(ev_mode, "mitm", 4) == 0);
+}
+
+static int pageCount(int total, int per_page) {
+    return (total <= 0) ? 1 : ((total + per_page - 1) / per_page);
+}
+
+static void drawBcTab(const char* label, int16_t x, int16_t y, int16_t w, bool active) {
+    uint16_t bg = active ? 0x0059 : 0x1082;
+    uint16_t fg = active ? C_WHITE : C_DIM;
+    gfx->fillRoundRect(x, y, w, 24, 5, bg);
+    gfx->drawRoundRect(x, y, w, 24, 5, C_HDR_TXT);
+    gfx->setTextColor(fg, bg);
+    gfx->setTextSize(1);
+    int tx = x + (w - strlen(label) * CHAR_W) / 2;
+    gfx->setCursor(tx, y + 8);
+    gfx->print(label);
+}
+
+static void drawBettercapSummary(int16_t y0) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_HDR_TXT, C_BG);
+    gfx->setCursor(12, y0);
+    gfx->print("SUMMARY");
+
+    char line[96];
+    gfx->setTextColor(C_WHITE, C_BG);
+    snprintf(line, sizeof(line), "LAN IF: %s", ev_bc_iface);
+    gfx->setCursor(12, y0 + 16); gfx->print(line);
+    snprintf(line, sizeof(line), "WIFI IF: %s", strlen(ev_bc_wifi_iface) ? ev_bc_wifi_iface : "off");
+    gfx->setCursor(12, y0 + 30); gfx->print(line);
+    snprintf(line, sizeof(line), "HOSTS: %d   APS: %d", ev_device_count, ev_wifi_ap_count);
+    gfx->setCursor(12, y0 + 44); gfx->print(line);
+
+    gfx->setTextColor(C_BC, C_BG);
+    gfx->setCursor(12, y0 + 62); gfx->print("MODULES");
+    gfx->setTextColor(C_WHITE, C_BG);
+    int mx = 12, my = y0 + 76;
+    for (int i = 0; i < ev_bc_module_count; i++) {
+        int len = strlen(ev_bc_modules[i]) * CHAR_W + 14;
+        if (mx + len > W - 12) {
+            mx = 12;
+            my += 14;
+        }
+        gfx->fillRoundRect(mx, my - 2, len, 12, 4, 0x1082);
+        gfx->setCursor(mx + 6, my);
+        gfx->print(ev_bc_modules[i]);
+        mx += len + 6;
+    }
+
+    gfx->setTextColor(C_INFO, C_BG);
+    gfx->setCursor(12, y0 + 104);
+    if (ev_bc_host_count > 0) {
+        snprintf(line, sizeof(line), "HOST SAMPLE: %s  %s", ev_bc_hosts[0].ipv4, ev_bc_hosts[0].mac);
+        gfx->print(line);
+    } else {
+        gfx->print("HOST SAMPLE: waiting...");
+    }
+
+    gfx->setTextColor(C_BC, C_BG);
+    gfx->setCursor(12, y0 + 118);
+    if (ev_bc_ap_count > 0) {
+        const char* name = strlen(ev_bc_aps[0].essid) ? ev_bc_aps[0].essid : ev_bc_aps[0].bssid;
+        snprintf(line, sizeof(line), "WIFI SAMPLE: %.20s ch%d %ddBm", name, ev_bc_aps[0].channel, ev_bc_aps[0].rssi);
+        gfx->print(line);
+    } else {
+        gfx->print("WIFI SAMPLE: waiting...");
+    }
+}
+
+static void drawBettercapHosts(int16_t y0) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_HDR_TXT, C_BG);
+    gfx->setCursor(12, y0);
+    char hdr[48];
+    int total_pages = pageCount(max(ev_bc_host_count, 1), BC_HOSTS_PER_PAGE);
+    snprintf(hdr, sizeof(hdr), "HOSTS  %d/%d", bc_host_page + 1, total_pages);
+    gfx->print(hdr);
+
+    if (ev_bc_host_count == 0) {
+        gfx->setTextColor(C_DIM, C_BG);
+        gfx->setCursor(12, y0 + 24);
+        gfx->print("No host details yet.");
+        return;
+    }
+
+    int start = bc_host_page * BC_HOSTS_PER_PAGE;
+    int end = min(start + BC_HOSTS_PER_PAGE, ev_bc_host_count);
+    int y = y0 + 18;
+    for (int i = start; i < end; i++) {
+        BettercapHost& h = ev_bc_hosts[i];
+        char line[96];
+        gfx->setTextColor(C_WHITE, C_BG);
+        snprintf(line, sizeof(line), "%s  %s", h.ipv4, h.mac);
+        gfx->setCursor(12, y); gfx->print(line);
+        gfx->setTextColor(C_DIM, C_BG);
+        const char* extra = strlen(h.hostname) ? h.hostname : h.vendor;
+        snprintf(line, sizeof(line), "%s", strlen(extra) ? extra : "(no hostname)");
+        gfx->setCursor(18, y + 10); gfx->print(line);
+        y += 24;
+    }
+}
+
+static void drawBettercapWifi(int16_t y0) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_HDR_TXT, C_BG);
+    gfx->setCursor(12, y0);
+    char hdr[48];
+    int total_pages = pageCount(max(ev_bc_ap_count, 1), BC_APS_PER_PAGE);
+    snprintf(hdr, sizeof(hdr), "WIFI  %d/%d", bc_wifi_page + 1, total_pages);
+    gfx->print(hdr);
+
+    if (ev_bc_ap_count == 0) {
+        gfx->setTextColor(C_DIM, C_BG);
+        gfx->setCursor(12, y0 + 24);
+        gfx->print("No AP details yet.");
+        return;
+    }
+
+    int start = bc_wifi_page * BC_APS_PER_PAGE;
+    int end = min(start + BC_APS_PER_PAGE, ev_bc_ap_count);
+    int y = y0 + 18;
+    for (int i = start; i < end; i++) {
+        BettercapAp& ap = ev_bc_aps[i];
+        char line[96];
+        const char* name = strlen(ap.essid) ? ap.essid : ap.bssid;
+        gfx->setTextColor(C_WHITE, C_BG);
+        snprintf(line, sizeof(line), "%.24s", name);
+        gfx->setCursor(12, y); gfx->print(line);
+        gfx->setTextColor(C_DIM, C_BG);
+        snprintf(line, sizeof(line), "ch:%d  rssi:%d  %.16s", ap.channel, ap.rssi, ap.security);
+        gfx->setCursor(18, y + 10); gfx->print(line);
+        y += 24;
+    }
+}
+
+static void drawBettercapOverlay() {
+    gfx->fillRect(0, 0, W, H, C_OVERLAY);
+    gfx->fillRect(0, 0, W, 34, 0x0030);
+    gfx->setTextColor(C_WHITE, 0x0030);
+    gfx->setTextSize(2);
+    gfx->setCursor(8, 8);
+    gfx->print("BETTERCAP");
+
+    gfx->fillRoundRect(270, 5, 40, 24, 4, 0x2000);
+    gfx->drawRoundRect(270, 5, 40, 24, 4, 0x6000);
+    gfx->setTextColor(0xF800, 0x2000);
+    gfx->setTextSize(2);
+    gfx->setCursor(283, 10);
+    gfx->print("X");
+
+    drawBcTab("SUMMARY", 10, 42, 92, bc_view == BC_VIEW_SUMMARY);
+    drawBcTab("HOSTS",   114, 42, 92, bc_view == BC_VIEW_HOSTS);
+    drawBcTab("WIFI",    218, 42, 92, bc_view == BC_VIEW_WIFI);
+
+    gfx->fillRoundRect(8, 74, 304, 112, 6, C_BG);
+    gfx->drawRoundRect(8, 74, 304, 112, 6, C_DIM);
+    if (bc_view == BC_VIEW_SUMMARY) drawBettercapSummary(84);
+    else if (bc_view == BC_VIEW_HOSTS) drawBettercapHosts(84);
+    else drawBettercapWifi(84);
+
+    bool can_prev = false, can_next = false;
+    if (bc_view == BC_VIEW_HOSTS) {
+        can_prev = bc_host_page > 0;
+        can_next = (bc_host_page + 1) < pageCount(ev_bc_host_count, BC_HOSTS_PER_PAGE);
+    } else if (bc_view == BC_VIEW_WIFI) {
+        can_prev = bc_wifi_page > 0;
+        can_next = (bc_wifi_page + 1) < pageCount(ev_bc_ap_count, BC_APS_PER_PAGE);
+    }
+
+    uint16_t prev_bg = can_prev ? 0x1082 : 0x0841;
+    uint16_t next_bg = can_next ? 0x1082 : 0x0841;
+    gfx->fillRoundRect(10, 198, 80, 32, 6, prev_bg);
+    gfx->drawRoundRect(10, 198, 80, 32, 6, C_HDR_TXT);
+    gfx->setTextColor(can_prev ? C_WHITE : C_DIM, prev_bg);
+    gfx->setTextSize(2);
+    gfx->setCursor(35, 206);
+    gfx->print("<");
+
+    gfx->fillRoundRect(104, 198, 112, 32, 6, 0x6000);
+    gfx->drawRoundRect(104, 198, 112, 32, 6, C_WHITE);
+    gfx->setTextColor(C_WHITE, 0x6000);
+    gfx->setTextSize(1);
+    gfx->setCursor(134, 210);
+    gfx->print("STOP MODE");
+
+    gfx->fillRoundRect(230, 198, 80, 32, 6, next_bg);
+    gfx->drawRoundRect(230, 198, 80, 32, 6, C_HDR_TXT);
+    gfx->setTextColor(can_next ? C_WHITE : C_DIM, next_bg);
+    gfx->setTextSize(2);
+    gfx->setCursor(259, 206);
+    gfx->print(">");
+}
+
 static void drawOverlay() {
+    if (isBettercapMode()) {
+        drawBettercapOverlay();
+        return;
+    }
     bool is_rj = (strncmp(ev_mode, "raspyjack", 9) == 0);
     OvButton* btns = is_rj ? rj_buttons : ov_buttons;
     int       n    = is_rj ? N_RJ_BUTTONS : N_OV_BUTTONS;
@@ -210,8 +418,8 @@ static void drawOverlay() {
     gfx->setTextColor(C_DIM, 0x1082);
     gfx->setTextSize(1);
     char status[64];
-    snprintf(status, sizeof(status), "mode: %-12s  hosts: %d",
-             ev_mode, ev_device_count);
+    snprintf(status, sizeof(status), "mode:%-10s h:%d ap:%d",
+             ev_mode, ev_device_count, ev_wifi_ap_count);
     gfx->setCursor(8, 178);
     gfx->print(status);
 
@@ -227,6 +435,47 @@ static void drawOverlay() {
 
 // Returns true if overlay should close (X tapped or command sent)
 static bool handleOverlayTouch(int tx, int ty) {
+    if (isBettercapMode()) {
+        if (tx >= 270 && tx <= 310 && ty >= 5 && ty <= 29) {
+            return true;
+        }
+        if (ty >= 42 && ty <= 66) {
+            if (tx >= 10 && tx <= 102) {
+                bc_view = BC_VIEW_SUMMARY;
+                drawOverlay();
+                return false;
+            }
+            if (tx >= 114 && tx <= 206) {
+                bc_view = BC_VIEW_HOSTS;
+                drawOverlay();
+                return false;
+            }
+            if (tx >= 218 && tx <= 310) {
+                bc_view = BC_VIEW_WIFI;
+                drawOverlay();
+                return false;
+            }
+        }
+        if (tx >= 104 && tx <= 216 && ty >= 198 && ty <= 230) {
+            evPostCmd(pt_pi_ip, pt_pi_port, "stop");
+            return true;
+        }
+        if (tx >= 10 && tx <= 90 && ty >= 198 && ty <= 230) {
+            if (bc_view == BC_VIEW_HOSTS && bc_host_page > 0) bc_host_page--;
+            if (bc_view == BC_VIEW_WIFI && bc_wifi_page > 0) bc_wifi_page--;
+            drawOverlay();
+            return false;
+        }
+        if (tx >= 230 && tx <= 310 && ty >= 198 && ty <= 230) {
+            int max_host_page = pageCount(ev_bc_host_count, BC_HOSTS_PER_PAGE) - 1;
+            int max_wifi_page = pageCount(ev_bc_ap_count, BC_APS_PER_PAGE) - 1;
+            if (bc_view == BC_VIEW_HOSTS && bc_host_page < max_host_page) bc_host_page++;
+            if (bc_view == BC_VIEW_WIFI && bc_wifi_page < max_wifi_page) bc_wifi_page++;
+            drawOverlay();
+            return false;
+        }
+        return false;
+    }
     // X / Back button
     if (tx >= 10 && tx <= 310 && ty >= 200 && ty <= 232) {
         return true;
@@ -313,6 +562,8 @@ void loop() {
         last_fetch_ms = now;
         evFetchStatus(pt_pi_ip, pt_pi_port);
         evFetchEvents(pt_pi_ip, pt_pi_port);
+        if (ev_bettercap) evFetchBettercap(pt_pi_ip, pt_pi_port);
+        else evClearBettercap();
 
         if (ev_new_lines && !overlay_visible) {
             // Push new lines into terminal
@@ -329,6 +580,9 @@ void loop() {
                 termPush(e.ts, e.level, e.msg);
             }
             term_dirty = true;
+        }
+        if (overlay_visible && isBettercapMode()) {
+            drawOverlay();
         }
     }
 
@@ -353,6 +607,11 @@ void loop() {
         if (!overlay_visible) {
             // Any tap opens overlay
             overlay_visible = true;
+            if (isBettercapMode()) {
+                bc_view = BC_VIEW_SUMMARY;
+                bc_host_page = 0;
+                bc_wifi_page = 0;
+            }
             drawOverlay();
         } else {
             if (handleOverlayTouch(sx, sy)) {

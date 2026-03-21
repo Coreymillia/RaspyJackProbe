@@ -88,7 +88,7 @@ async function go(){
       `<div class="box">GW: <span>${gw.ipv4||'?'}</span></div>`;
     document.getElementById('mods').innerHTML=
       (d.modules||[]).map(m=>`<span class="mod ${m.running?'on':'off'}">${m.name}</span>`).join('');
-    const eps=(d.endpoints||[]).slice().sort((a,b)=>{
+    const eps=((d.lan&&d.lan.hosts)?d.lan.hosts:(d.endpoints||[])).slice().sort((a,b)=>{
       const x=(a.ipv4||'').split('.').map(Number),y=(b.ipv4||'').split('.').map(Number);
       for(let i=0;i<4;i++)if(x[i]!==y[i])return x[i]-y[i];return 0;
     });
