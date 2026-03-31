@@ -43,6 +43,7 @@ static char  ev_mode[24]     = "idle";
 static int   ev_device_count = 0;
 static int   ev_wifi_ap_count = 0;
 static bool  ev_bettercap    = false;
+static bool  ev_api_online   = false;
 static char  ev_bc_iface[16] = "?";
 static char  ev_bc_wifi_iface[16] = "";
 static char  ev_bc_modules[BC_MODULE_MAX][16];
@@ -66,14 +67,15 @@ static bool evFetchStatus(const char* host, uint16_t port) {
     HTTPClient http;
     http.begin(url); http.setTimeout(3000);
     int code = http.GET();
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { ev_api_online = false; http.end(); return false; }
     String body = http.getString(); http.end();
     JsonDocument doc;
-    if (deserializeJson(doc, body)) return false;
+    if (deserializeJson(doc, body)) { ev_api_online = false; return false; }
     strlcpy(ev_mode, doc["mode"] | "idle", sizeof(ev_mode));
     ev_device_count = doc["device_count"] | 0;
     ev_wifi_ap_count = doc["wifi_ap_count"] | 0;
     ev_bettercap    = doc["bettercap"] | false;
+    ev_api_online = true;
     return true;
 }
 

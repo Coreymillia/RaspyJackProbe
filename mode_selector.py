@@ -8,6 +8,8 @@ KEY2 (BCM 20)      →  Mode 2: RaspyJack
 KEY3 (BCM 16)      →  Mode 3: Bettercap Monitor (passive LAN/Wi-Fi + MITM toggle)
 JOY UP (BCM 6)     →  Mode 4: Quick Scan (one-shot ARP → LCD → return)
 JOY LEFT (BCM 5)   →  Mode 5: Wi-Fi Scanner (airodump-ng AP list)
+JOY DOWN (BCM 19)  →  Mode 6: Port Scanner
+JOY RIGHT (BCM 26) →  Mode 7: YouTube Stream (live RTMP via USB microscope cam)
 JOY PRESS (BCM 13) →  Settings Portal
 """
 import re
@@ -31,6 +33,7 @@ JOYSTICK_UP    = 6    # Quick Scan
 JOYSTICK_DOWN  = 19   # Port Scanner
 JOYSTICK_PRESS = 13   # Settings portal
 JOYSTICK_LEFT  = 5    # Wi-Fi scanner in menu, MITM toggle inside Bettercap mode
+JOYSTICK_RIGHT = 26   # YouTube Stream
 
 _PROJECT_DIR  = '/root/RaspyJackProbe'
 _CONFIG_PATH  = os.path.join(_PROJECT_DIR, 'config.json')
@@ -85,17 +88,18 @@ def draw_menu(lcd, selected=None):
         (4, 'JOY\u2191  Quick Scan', 'One-shot ARP Sweep',  (100, 60, 0)),
         (5, 'JOY\u2193  Port Scan',  'nmap All Hosts',      (60, 0, 120)),
         (6, 'JOY\u2190  WiFi Scan',  '2.4/5 GHz AP List',   (0, 90, 120)),
+        (7, 'JOY\u2192  YT Stream',  'Live to YouTube',      (180, 20, 20)),
     ]
     for i, (num, title, sub, color) in enumerate(modes):
-        y0 = 14 + i * 16
-        y1 = y0 + 14
+        y0 = 14 + i * 14
+        y1 = y0 + 12
         bg = color if selected == num else (30, 30, 30)
         draw.rectangle([(3, y0), (124, y1)], fill=bg, outline=(60, 60, 60))
         draw.text((7, y0 + 1), title, font=f8, fill=(255, 255, 255))
-        draw.text((7, y0 + 8), sub, font=f7, fill=(180, 180, 180))
+        draw.text((7, y0 + 7), sub, font=f7, fill=(180, 180, 180))
 
-    draw.line([(0, 111), (128, 111)], fill=(50, 50, 50))
-    draw.text((4, 114), 'JOY\u25cf  \u2699 Settings Portal', font=f7, fill=(180, 140, 0))
+    draw.line([(0, 112), (128, 112)], fill=(50, 50, 50))
+    draw.text((4, 115), 'JOY\u25cf  \u2699 Settings Portal', font=f7, fill=(180, 140, 0))
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -221,7 +225,7 @@ def _check_reboot_hold(lcd, joy_hold_count):
 
 
 # ── CYD Event / Command Server ───────────────────────────────────────────────
-# Runs on port 8765 in a daemon thread. Never blocks the main loop.
+# Runs on port 9090 in a daemon thread. Never blocks the main loop.
 #
 #  GET  /status    → {"mode": "...", "device_count": N, "wifi_ap_count": N, "bettercap": bool}
 #  GET  /events    → {"events": [{ts,level,msg}, ...]}  (newest last)
@@ -305,6 +309,7 @@ class _CYDHandler(BaseHTTPRequestHandler):
                 _valid = {
                     'anomaly_detector', 'raspyjack', 'bettercap', 'quick_scan', 'port_scan', 'wifi_scan',
                     'stop', 'rj_net_scan', 'rj_arp_scan', 'rj_loot', 'rj_stop', 'rj_port_scan',
+                    'youtube_stream', 'youtube_stop',
                 }
                 if cmd in _valid:
                     with _cmd_lock:
@@ -487,6 +492,12 @@ button{{margin-top:24px;width:100%;padding:12px;background:#0a6;color:#fff;borde
 <div class="hint">Writes <code style="color:#0af">net.ipv4.ip_forward=1</code> to <code style="color:#0af">/etc/sysctl.d/</code> &mdash; required for MITM. MITM mode sets this automatically while active.</div>
 </div>
 
+<div class="sec"><h3>YouTube Live Streaming</h3>
+<label>Stream Key</label>
+<input type="password" name="youtube_stream_key" value="{v('youtube_stream_key')}">
+<div class="hint">From YouTube Studio &rarr; Go Live &rarr; Stream key. Stored locally &mdash; never leaves the Pi.</div>
+</div>
+
 <button type="submit">&#128190; Save Config</button>
 </form></body></html>"""
 
@@ -522,7 +533,7 @@ def _draw_saved_screen(lcd):
 
 def launch_settings_portal(lcd):
     local_ip = _get_local_ip()
-    PORT     = 8080
+    PORT     = 8090
     _draw_settings_screen(lcd, local_ip, PORT)
     saved    = threading.Event()
 
@@ -560,6 +571,7 @@ def launch_settings_portal(lcd):
             cfg['mitm_dns_address'] = get('mitm_dns_address').strip()
             cfg['mitm_http_proxy']  = (get('mitm_http_proxy') == 'true')
             cfg['ip_forward_persistent'] = (get('ip_forward_persistent') == 'true')
+            cfg['youtube_stream_key'] = get('youtube_stream_key').strip()
 
             try:
                 cfg['anomaly_poll_interval'] = int(get('anomaly_poll_interval', '30'))
@@ -1312,7 +1324,188 @@ def launch_wifi_scanner(lcd):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Mode: YouTube Stream ──────────────────────────────────────────────────────
+_YT_SNAP_PATH  = '/tmp/yt_snap.jpg'
+_YT_RTMP_BASE  = 'rtmp://a.rtmp.youtube.com/live2'
+_YT_VIDEO_DEV  = '/dev/video0'
+
+
+def _draw_youtube_nokey_screen(lcd):
+    img  = Image.new('RGB', (128, 128), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    f8b  = _font(_FONT_PATH_BOLD, 8)
+    f8   = _font(_FONT_PATH, 8)
+    f7   = _font(_FONT_PATH, 7)
+    draw.rectangle([(0, 0), (128, 14)], fill=(180, 0, 0))
+    draw.text((4, 3), 'NO STREAM KEY', font=f8b, fill=(255, 255, 0))
+    draw.text((4, 22), 'Open Settings Portal', font=f7, fill=(200, 200, 200))
+    draw.text((4, 33), 'and enter your', font=f7, fill=(200, 200, 200))
+    draw.text((4, 44), 'YouTube stream key.', font=f7, fill=(200, 200, 200))
+    draw.line([(0, 58), (128, 58)], fill=(50, 50, 50))
+    draw.text((4, 63), 'JOY\u25cf = Settings', font=f8, fill=(180, 140, 0))
+    draw.text((4, 78), 'Any KEY = back', font=f7, fill=(120, 120, 120))
+    lcd.LCD_ShowImage(img, 0, 0)
+
+
+def _draw_youtube_live_screen(lcd, is_live, uptime_s, key_hint, snap_loaded):
+    img  = Image.new('RGB', (128, 128), (10, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    if snap_loaded and os.path.exists(_YT_SNAP_PATH):
+        try:
+            snap = Image.open(_YT_SNAP_PATH).resize((128, 128))
+            img.paste(snap, (0, 0))
+        except Exception:
+            pass
+
+    draw = ImageDraw.Draw(img)
+    f8b  = _font(_FONT_PATH_BOLD, 8)
+    f8   = _font(_FONT_PATH, 8)
+    f7   = _font(_FONT_PATH, 7)
+
+    hdr_col = (200, 0, 0) if is_live else (80, 80, 80)
+    draw.rectangle([(0, 0), (128, 14)], fill=hdr_col)
+    status_lbl = '\u25cf LIVE' if is_live else '\u25a0 STOPPED'
+    draw.text((4, 3), f'YOUTUBE  {status_lbl}', font=f7, fill=(255, 255, 255))
+
+    draw.rectangle([(0, 80), (128, 128)], fill=(0, 0, 0))
+    h = uptime_s // 3600
+    m = (uptime_s % 3600) // 60
+    s = uptime_s % 60
+    uptime_col = (80, 255, 80) if is_live else (150, 150, 150)
+    draw.text((4, 82), f'720p30  key: {key_hint}', font=f7, fill=(180, 180, 180))
+    draw.text((4, 92), f'Up: {h:02d}:{m:02d}:{s:02d}', font=f8b, fill=uptime_col)
+    draw.line([(0, 104), (128, 104)], fill=(50, 50, 50))
+    draw.text((4, 107), 'KEY1/2/3 = stop stream', font=f7, fill=(130, 130, 130))
+
+    lcd.LCD_ShowImage(img, 0, 0)
+
+
+def launch_youtube_stream(lcd):
+    draw_selected(lcd, 'YT Stream', (180, 20, 20))
+    time.sleep(0.5)
+
+    try:
+        cfg = json.load(open(_CONFIG_PATH))
+    except Exception:
+        cfg = {}
+
+    stream_key = cfg.get('youtube_stream_key', '').strip()
+    if not stream_key:
+        _draw_youtube_nokey_screen(lcd)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if (GPIO.input(KEY1_PIN) == GPIO.LOW or
+                    GPIO.input(KEY2_PIN) == GPIO.LOW or
+                    GPIO.input(KEY3_PIN) == GPIO.LOW):
+                break
+            time.sleep(0.05)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
+
+    _set_mode('youtube_stream')
+    _stop_event.clear()
+
+    key_hint = f'****{stream_key[-4:]}' if len(stream_key) >= 4 else '****'
+    rtmp_url  = f'{_YT_RTMP_BASE}/{stream_key}'
+
+    # Grab an initial snapshot with fswebcam (more reliable than ffmpeg MJPEG for this camera)
+    snap_loaded = False
+    try:
+        r = subprocess.run(
+            ['fswebcam', '-d', _YT_VIDEO_DEV, '-r', '640x480',
+             '--jpeg', '90', '--skip', '20', '--no-banner', _YT_SNAP_PATH],
+            timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        snap_loaded = (r.returncode == 0 and os.path.exists(_YT_SNAP_PATH))
+    except Exception:
+        pass
+
+    # Single ffmpeg process streaming to YouTube.
+    # H264 native input → re-encode with brightness boost → RTMP.
+    # No split/thumbnail in ffmpeg (fps=1/120 buffers too many frames on Pi).
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-f', 'v4l2', '-input_format', 'h264',
+        '-video_size', '1280x720', '-framerate', '30',
+        '-i', _YT_VIDEO_DEV,
+        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-vf', 'eq=brightness=0.15:contrast=1.5:gamma=1.5',
+        '-map', '0:v', '-map', '1:a',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
+        '-pix_fmt', 'yuv420p', '-g', '60',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-f', 'flv', rtmp_url,
+    ]
+
+    def _start_stream():
+        return subprocess.Popen(
+            ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    stream_proc = _start_stream()
+    _push_event('YT', f'\u25b6 YouTube stream started \u2192 {key_hint}')
+
+    start_time  = time.monotonic()
+    k1w = k2w = k3w = False
+    retries     = 0
+    MAX_RETRIES = 5
+    stopped     = False
+
+    while not stopped:
+        uptime_s = int(time.monotonic() - start_time)
+        is_live  = stream_proc.poll() is None
+        _draw_youtube_live_screen(lcd, is_live, uptime_s, key_hint,
+                                  snap_loaded or os.path.exists(_YT_SNAP_PATH))
+
+        # ffmpeg died — auto-reconnect unless user stopped or too many retries
+        if not is_live and not _stop_event.is_set():
+            retries += 1
+            if retries <= MAX_RETRIES:
+                _push_event('YT', f'\u26a0 Connection lost — retry {retries}/{MAX_RETRIES}')
+                time.sleep(5)
+                stream_proc = _start_stream()
+                continue
+            else:
+                _push_event('YT', f'\u25a0 Stream failed after {MAX_RETRIES} retries')
+                time.sleep(3)
+                stopped = True
+                break
+
+        if _stop_event.is_set():
+            _stop_event.clear()
+            stopped = True
+            break
+
+        with _cmd_lock:
+            pending = _cmd_queue.copy()
+            _cmd_queue.clear()
+        for c in pending:
+            if c in ('stop', 'youtube_stop'):
+                _stop_event.set()
+
+        if _stop_event.is_set():
+            _stop_event.clear()
+            stopped = True
+            break
+
+        k1 = GPIO.input(KEY1_PIN) == GPIO.LOW
+        k2 = GPIO.input(KEY2_PIN) == GPIO.LOW
+        k3 = GPIO.input(KEY3_PIN) == GPIO.LOW
+        if (k1 and not k1w) or (k2 and not k2w) or (k3 and not k3w):
+            stopped = True
+            break
+        k1w, k2w, k3w = k1, k2, k3
+
+        time.sleep(2)
+
+    _terminate_proc(stream_proc)
+    _push_event('YT', '\u25a0 YouTube stream stopped')
+    _set_mode('idle')
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def main():
     # Restore ip_forward to configured persistent value on startup
     try:
@@ -1336,6 +1529,7 @@ def main():
     GPIO.setup(JOYSTICK_DOWN,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(JOYSTICK_PRESS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(JOYSTICK_LEFT,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(JOYSTICK_RIGHT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     draw_menu(lcd)
 
@@ -1345,6 +1539,7 @@ def main():
     ju_was = GPIO.input(JOYSTICK_UP) == GPIO.LOW
     jd_was = GPIO.input(JOYSTICK_DOWN) == GPIO.LOW
     jl_was = GPIO.input(JOYSTICK_LEFT) == GPIO.LOW
+    jr_was = GPIO.input(JOYSTICK_RIGHT) == GPIO.LOW
 
     while True:
         # CYD remote commands
@@ -1376,6 +1571,10 @@ def main():
                 _stop_event.clear()
                 draw_menu(lcd, selected=6); time.sleep(0.15)
                 launch_wifi_scanner(lcd)
+            elif cmd == 'youtube_stream':
+                _stop_event.clear()
+                draw_menu(lcd, selected=7); time.sleep(0.15)
+                launch_youtube_stream(lcd)
             elif cmd == 'stop':
                 _stop_event.clear()
                 _set_mode('idle')
@@ -1416,6 +1615,13 @@ def main():
             time.sleep(0.25)
             launch_wifi_scanner(lcd)
         jl_was = jl
+
+        jr = GPIO.input(JOYSTICK_RIGHT) == GPIO.LOW
+        if jr and not jr_was:
+            draw_menu(lcd, selected=7)
+            time.sleep(0.25)
+            launch_youtube_stream(lcd)
+        jr_was = jr
 
         jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
         if jp and not jp_was:

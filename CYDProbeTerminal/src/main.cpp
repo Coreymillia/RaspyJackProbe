@@ -13,7 +13,7 @@
  *   - Cyan   = MODE   (mode changes)
  *
  * Tap anywhere → control overlay, or Bettercap detail tabs while in Bettercap mode.
- * Buttons POST /cmd to Pi event server on port 8765.
+ * Buttons POST /cmd to the configured Pi event server (default port 9090).
  */
 
 #include <Arduino.h>
@@ -142,10 +142,10 @@ static void drawHeader() {
 
     // Right: device count + wifi
     char right[32];
-    snprintf(right, sizeof(right), "h:%d ap:%d %s",
+    snprintf(right, sizeof(right), "h:%d ap:%d api:%s",
              ev_device_count,
              ev_wifi_ap_count,
-             (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "no wifi");
+             ev_api_online ? "ok" : "down");
     gfx->setCursor(W - strlen(right) * CHAR_W - 4, 5);
     gfx->print(right);
 }
@@ -543,8 +543,10 @@ void setup() {
     gfx->fillScreen(C_BG);
     drawHeader();
 
-    // Seed the terminal with a connect message
-    termPush("--:--:--", "INFO", "Connected to Pi probe");
+    // Seed the terminal with the current Pi target so bad portal settings are visible.
+    char target[96];
+    snprintf(target, sizeof(target), "Probe target %s:%u", pt_pi_ip, pt_pi_port);
+    termPush("--:--:--", "INFO", target);
     termRedraw();
 }
 

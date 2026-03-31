@@ -1,16 +1,19 @@
 // Portal.h — WiFi captive portal + NVS settings for CYDProbeTerminal
-// Stores: WiFi SSID/pass, Pi IP, Pi event-server port (default 8765)
+// Stores: WiFi SSID/pass, Pi address/hostname, Pi event-server port (default 9090)
 
 #pragma once
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 
+#define PT_DEFAULT_PI_ADDR "192.168.0.123"
+
 static char     pt_wifi_ssid[64] = "";
 static char     pt_wifi_pass[64] = "";
-static char     pt_pi_ip[64]     = "192.168.0.121";
+static char     pt_pi_ip[64]     = PT_DEFAULT_PI_ADDR;
 static uint16_t pt_pi_port       = 9090;
 static bool     pt_has_settings  = false;
 
@@ -21,7 +24,7 @@ static void ptLoadSettings() {
     pt_has_settings = _pt_prefs.getBool("configured", false);
     strlcpy(pt_wifi_ssid, _pt_prefs.getString("ssid",  "").c_str(),             sizeof(pt_wifi_ssid));
     strlcpy(pt_wifi_pass, _pt_prefs.getString("wpass", "").c_str(),             sizeof(pt_wifi_pass));
-    strlcpy(pt_pi_ip,     _pt_prefs.getString("piip",  "192.168.0.121").c_str(), sizeof(pt_pi_ip));
+    strlcpy(pt_pi_ip,     _pt_prefs.getString("piip",  PT_DEFAULT_PI_ADDR).c_str(), sizeof(pt_pi_ip));
     pt_pi_port = (uint16_t)_pt_prefs.getUInt("piport", 9090);
     _pt_prefs.end();
 }
@@ -45,6 +48,24 @@ static void ptSaveSettings(const char* ssid, const char* wpass,
 static WebServer _pt_server(80);
 static DNSServer _pt_dns;
 
+static bool ptProbeApiReachable(uint8_t attempts = 5, uint16_t delay_ms = 1000) {
+    char url[160];
+    snprintf(url, sizeof(url), "http://%s:%u/status", pt_pi_ip, pt_pi_port);
+
+    for (uint8_t attempt = 0; attempt < attempts; attempt++) {
+        HTTPClient http;
+        http.begin(url);
+        http.setTimeout(2500);
+        int code = http.GET();
+        http.end();
+        if (code == 200) {
+            return true;
+        }
+        delay(delay_ms);
+    }
+    return false;
+}
+
 static const char PT_HTML[] PROGMEM = R"html(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -65,7 +86,7 @@ button{margin-top:20px;width:100%;padding:12px;background:#003322;
 <input name="ssid"   value="{SSID}">
 <label>WiFi Password</label>
 <input name="wpass"  type="password">
-<label>Pi IP Address</label>
+<label>Pi Address / Hostname</label>
 <input name="piip"   value="{PIIP}">
 <label>Pi Event Port (default 9090)</label>
 <input name="piport" type="number" value="{PIPORT}">
@@ -124,6 +145,9 @@ static bool ptConnect() {
         delay(250);
     }
     if (WiFi.status() != WL_CONNECTED) {
+        ptRunPortal();
+    }
+    if (!ptProbeApiReachable()) {
         ptRunPortal();
     }
     return true;

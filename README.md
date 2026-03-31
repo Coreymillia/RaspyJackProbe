@@ -6,6 +6,7 @@
 - a **Cheap Yellow Display (CYD)** as a live remote terminal and touch controller
 - **Bettercap**, **RaspyJack**, `arp-scan`, `nmap`, and `aircrack-ng` tools behind a simple launcher
 - a dedicated passive **2.4 GHz + 5 GHz Wi-Fi scanner**
+- a **YouTube live streaming mode** using a USB microscope camera
 
 The goal is to make a small, portable, offline network recon box that can be driven either from the Pi itself or from the CYD without needing a keyboard or monitor.
 
@@ -27,6 +28,7 @@ It currently supports:
 - quick host discovery
 - multi-host port scanning
 - dedicated passive Wi-Fi AP scanning with 2.4 GHz and 5 GHz support
+- **YouTube live streaming** via a USB microscope camera over RTMP
 
 ---
 
@@ -38,6 +40,7 @@ This repository is built around the following setup:
 - **Waveshare 1.44" LCD HAT**
 - **Waveshare Ethernet HAT**
 - **USB Wi-Fi dongle** based on **MediaTek MT7612U** for monitor-mode Wi-Fi scanning
+- **USB microscope camera** (HY-3307 / Z-Star Venus, H264, 720p30) for YouTube streaming
 - **ESP32 Cheap Yellow Display (CYD)** running the companion terminal UI in `CYDProbeTerminal/`
 
 ---
@@ -66,6 +69,7 @@ These photos are included in the repo with metadata stripped before publishing.
 | `JOY ↑` | Quick Scan | One-shot `arp-scan` host sweep |
 | `JOY ↓` | Port Scan | Multi-host `nmap` scan |
 | `JOY ←` | Wi-Fi Scan | Dedicated passive AP scanner with 2.4/5 GHz support |
+| `JOY →` | YouTube Stream | Live streams the USB microscope camera to YouTube |
 | `JOY ●` | Settings Portal | Starts the config web portal |
 
 ### Special controls
@@ -85,6 +89,7 @@ The CYD acts like a remote terminal and launcher for the Pi.
 - It shows a scrolling event log from the Pi.
 - Header data includes current mode, host count, and Wi-Fi AP count.
 - Tap the screen to open the touch control overlay.
+- On boot, the CYD now verifies the Pi API before entering the terminal UI. If the saved Pi address/port is wrong, it drops back into the setup portal instead of silently showing a dead terminal.
 
 ### CYD control overlay buttons
 
@@ -94,6 +99,7 @@ The CYD acts like a remote terminal and launcher for the Pi.
 - `WIFI SCAN`
 - `QUICK SCAN`
 - `PORT SCAN`
+- `YT STREAM`
 - `STOP MODE`
 
 ### Bettercap detail overlay
@@ -212,14 +218,36 @@ Displayed AP details include:
 - RSSI
 - security
 
+## 7. YouTube Stream
+
+Streams the attached USB microscope camera live to YouTube over RTMP.
+
+Before streaming:
+
+1. Get a stream key from [YouTube Studio → Go Live → Stream](https://studio.youtube.com/)
+2. Enter it in the **Settings Portal** (`http://<pi-ip>:8090`) under the YouTube Stream Key field
+3. Press **`JOY →`** to start the stream
+
+How it works:
+
+- Grabs a thumbnail snapshot from the camera and displays it on the Pi LCD before starting
+- Captures H264 video from the USB camera at 720p30 using `v4l2`
+- Re-encodes with `libx264` (ultrafast / zerolatency preset) and injects silent AAC audio to satisfy YouTube's audio track requirement
+- Applies a brightness/contrast boost (`eq=brightness=0.15:contrast=1.5:gamma=1.5`) to improve visibility in low-light conditions
+- Auto-reconnects up to 5 times if the stream drops
+
+> **Camera focus tip:** The USB microscope camera does not have autofocus. Focus and frame your shot using your PC's camera software first, then start the stream. The Pi LCD shows the snapshot taken at launch so you can verify framing.
+
+> **Stream key note:** YouTube stream keys expire per session unless you use a persistent key. Generate a fresh key in YouTube Studio each time you start a new live session, or enable the persistent stream key option in YouTube Studio settings.
+
 ---
 
 ## Web interfaces and ports
 
 | Port | Service | Purpose |
 |---|---|---|
-| `8080` | Settings Portal | Edit runtime settings from a browser |
 | `8082` | Bettercap Dashboard | Simple dark Bettercap status page |
+| `8090` | Settings Portal | Edit runtime settings from a browser |
 | `9090` | CYD Event/Command API | `/status`, `/events`, `/bettercap`, `/cmd` |
 
 ---
@@ -261,14 +289,14 @@ Install the main packages used by this project:
 
 ```bash
 sudo apt update
-sudo apt install -y bettercap arp-scan aircrack-ng nmap
+sudo apt install -y bettercap arp-scan aircrack-ng nmap ffmpeg fswebcam
 pip install -r requirements.txt
 ```
 
 ## 2. Clone and configure
 
 ```bash
-git clone https://github.com/Coreymillia/RaspyJack-Bettercap-Pi-Zero-2-W-CYD.git /root/RaspyJackProbe
+git clone https://github.com/Coreymillia/RaspyJackProbe.git /root/RaspyJackProbe
 cd /root/RaspyJackProbe
 cp config.example.json config.json
 ```
@@ -305,6 +333,7 @@ Edit settings through the **Settings Portal** or directly in `config.json`.
 | `ip_forward_persistent` | `false` | Persist IP forwarding across boots |
 | `anomaly_poll_interval` | `30` | Seconds between anomaly polls |
 | `anomaly_spike_threshold` | `3` | Device spike alert threshold |
+| `youtube_stream_key` | `""` | YouTube RTMP stream key for Mode 7 |
 
 ---
 
@@ -323,6 +352,8 @@ Flash:
 ```bash
 pio run -d CYDProbeTerminal -t upload --upload-port /dev/ttyUSB0
 ```
+
+If the CYD is on Wi-Fi but does not receive events or control the Pi, reconnect it to the setup portal and confirm the Pi address/port. For this probe, the live Pi API is currently responding at `http://192.168.0.123:9090/status`.
 
 ---
 
@@ -361,5 +392,6 @@ At this point, the project includes:
 - working quick scan and port scan
 - working anomaly detector
 - working dedicated Wi-Fi scanner with 2.4 GHz and 5 GHz visibility
+- **YouTube live streaming via USB microscope camera (Mode 7, JOY →)**
 
-It started as a compact probe box and is now a usable multi-mode portable network toolkit.
+It started as a compact probe box and is now a usable multi-mode portable network toolkit with live streaming capability.
