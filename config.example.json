@@ -10,5 +10,9 @@
 
     "_anomaly_comment": "Anomaly detector settings. poll_interval = seconds between Bettercap scans. spike_threshold = how many NEW devices in one poll triggers a spike alert.",
     "anomaly_poll_interval": 30,
-    "anomaly_spike_threshold": 3
+    "anomaly_spike_threshold": 3,
+
+    "_youtube_comment": "YouTube RTMP stream key (from YouTube Studio → Go Live). otr_station_url sets the live radio audio overlaid on the stream — defaults to 1940s Radio if blank.",
+    "youtube_stream_key": "",
+    "otr_station_url": "http://149.255.60.195:8256/stream"
 }

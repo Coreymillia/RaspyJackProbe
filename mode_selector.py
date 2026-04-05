@@ -444,6 +444,17 @@ def _settings_html(cfg):
         return str(val).replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
 
     ip_fwd_checked = 'checked' if cfg.get('ip_forward_persistent', False) else ''
+
+    current_otr = cfg.get('otr_station_url', _OTR_DEFAULT) or _OTR_DEFAULT
+    otr_opts = ''
+    matched = False
+    for sname, surl in _OTR_STATIONS:
+        sel = ' selected' if surl == current_otr else ''
+        if sel:
+            matched = True
+        otr_opts += f'<option value="{surl}"{sel}>{sname}</option>\n'
+    if not matched:
+        otr_opts += f'<option value="{current_otr}" selected>Custom: {current_otr}</option>\n'
     return f"""<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RaspyJackProbe Settings</title><style>
@@ -496,6 +507,10 @@ button{{margin-top:24px;width:100%;padding:12px;background:#0a6;color:#fff;borde
 <label>Stream Key</label>
 <input type="password" name="youtube_stream_key" value="{v('youtube_stream_key')}">
 <div class="hint">From YouTube Studio &rarr; Go Live &rarr; Stream key. Stored locally &mdash; never leaves the Pi.</div>
+<label>OTR Audio Station</label>
+<select name="otr_station_url" style="width:100%;background:#222;color:#fff;border:1px solid #444;padding:6px;border-radius:4px;font-family:monospace;font-size:13px">
+{otr_opts}</select>
+<div class="hint">Live audio overlaid on stream &mdash; ROKiT Radio Network OTR streams. Default: 1940s Radio.</div>
 </div>
 
 <button type="submit">&#128190; Save Config</button>
@@ -572,6 +587,7 @@ def launch_settings_portal(lcd):
             cfg['mitm_http_proxy']  = (get('mitm_http_proxy') == 'true')
             cfg['ip_forward_persistent'] = (get('ip_forward_persistent') == 'true')
             cfg['youtube_stream_key'] = get('youtube_stream_key').strip()
+            cfg['otr_station_url']    = get('otr_station_url').strip() or _OTR_DEFAULT
 
             try:
                 cfg['anomaly_poll_interval'] = int(get('anomaly_poll_interval', '30'))
@@ -1329,6 +1345,47 @@ _YT_SNAP_PATH  = '/tmp/yt_snap.jpg'
 _YT_RTMP_BASE  = 'rtmp://a.rtmp.youtube.com/live2'
 _YT_VIDEO_DEV  = '/dev/video0'
 
+# ── OTR radio stations (ROKiT Radio Network, 48 kbps MP3 HTTP streams) ────────
+_OTR_STATIONS = [
+    ('1940s Radio',       'http://149.255.60.195:8256/stream'),
+    ('American Comedy',   'http://149.255.60.193:8162/stream'),
+    ('American Classics', 'http://149.255.60.194:8043/stream'),
+    ('Jazz Central',      'http://149.255.60.195:8027/stream'),
+    ('Comedy Gold',       'http://149.255.60.195:8150/stream'),
+    ('Mystery Radio',     'http://149.255.60.195:8168/stream'),
+    ('Crime & Suspense',  'http://149.255.60.193:8168/stream'),
+    ('Crime Radio',       'http://149.255.60.194:8039/stream'),
+    ('Adventure Stories', 'http://149.255.60.195:8162/stream'),
+    ('Drama Radio',       'http://149.255.60.195:8174/stream'),
+    ('Nostalgia Lane',    'http://149.255.60.195:8180/stream'),
+    ('Science Fiction',   'http://149.255.60.194:8110/stream'),
+]
+_OTR_DEFAULT = 'http://149.255.60.195:8256/stream'  # 1940s Radio
+
+def _otr_name_for_url(url):
+    for name, u in _OTR_STATIONS:
+        if u == url:
+            return name
+    return 'Custom Station'
+
+# ── Camera profiles ────────────────────────────────────────────────────────────
+# type 'usb' → v4l2 H264 device input (USB microscope, existing hardware)
+# type 'csi' → libcamera-vid H264 pipe into ffmpeg (ribbon CSI cameras)
+_YT_CAMERAS = [
+    {'name': 'USB Microscope', 'short': 'USB-CAM',
+     'type': 'usb', 'device': '/dev/video0',
+     'width': 1280, 'height': 720,  'fps': 30},
+    {'name': 'Arducam CSI',    'short': 'ARDUCAM',
+     'type': 'csi',
+     'width': 1280, 'height': 720,  'fps': 30},
+    {'name': 'Pi Camera v2.1', 'short': 'PI-CAM',
+     'type': 'csi',
+     'width': 1280, 'height': 720,  'fps': 30},
+    {'name': 'HQ Camera',      'short': 'HQ-CAM',
+     'type': 'csi',
+     'width': 1920, 'height': 1080, 'fps': 30},
+]
+
 
 def _draw_youtube_nokey_screen(lcd):
     img  = Image.new('RGB', (128, 128), (0, 0, 0))
@@ -1347,7 +1404,35 @@ def _draw_youtube_nokey_screen(lcd):
     lcd.LCD_ShowImage(img, 0, 0)
 
 
-def _draw_youtube_live_screen(lcd, is_live, uptime_s, key_hint, snap_loaded):
+def _draw_youtube_camera_menu(lcd, selected_idx):
+    img  = Image.new('RGB', (128, 128), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    f8b  = _font(_FONT_PATH_BOLD, 8)
+    f8   = _font(_FONT_PATH, 8)
+    f7   = _font(_FONT_PATH, 7)
+    draw.rectangle([(0, 0), (128, 14)], fill=(180, 20, 20))
+    draw.text((4, 3), '\u25b6 SELECT CAMERA', font=f8b, fill=(255, 255, 255))
+    labels = [
+        ('USB Microscope', '720p30 \u00b7 USB'),
+        ('Arducam CSI',    '720p30 \u00b7 Ribbon'),
+        ('Pi Camera v2.1', '720p30 \u00b7 CSI'),
+        ('HQ Camera',      '1080p30 \u00b7 CSI'),
+    ]
+    for i, (name, sub) in enumerate(labels):
+        y0 = 17 + i * 23
+        bg = (120, 20, 20) if i == selected_idx else (25, 25, 25)
+        draw.rectangle([(2, y0), (125, y0 + 20)], fill=bg, outline=(60, 60, 60))
+        prefix = '\u25ba ' if i == selected_idx else '  '
+        draw.text((5,  y0 + 2),  prefix + name, font=f8, fill=(255, 255, 255))
+        draw.text((14, y0 + 12), sub,            font=f7, fill=(160, 160, 160))
+    draw.line([(0, 109), (128, 109)], fill=(50, 50, 50))
+    draw.text((4, 112), 'JOY\u2191\u2193=sel  \u25cf=go  K=back', font=f7,
+              fill=(130, 130, 130))
+    lcd.LCD_ShowImage(img, 0, 0)
+
+
+def _draw_youtube_live_screen(lcd, is_live, uptime_s, key_hint, snap_loaded,
+                              cam_name='', station_name=''):
     img  = Image.new('RGB', (128, 128), (10, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -1368,15 +1453,17 @@ def _draw_youtube_live_screen(lcd, is_live, uptime_s, key_hint, snap_loaded):
     status_lbl = '\u25cf LIVE' if is_live else '\u25a0 STOPPED'
     draw.text((4, 3), f'YOUTUBE  {status_lbl}', font=f7, fill=(255, 255, 255))
 
-    draw.rectangle([(0, 80), (128, 128)], fill=(0, 0, 0))
+    draw.rectangle([(0, 79), (128, 128)], fill=(0, 0, 0))
     h = uptime_s // 3600
     m = (uptime_s % 3600) // 60
     s = uptime_s % 60
     uptime_col = (80, 255, 80) if is_live else (150, 150, 150)
-    draw.text((4, 82), f'720p30  key: {key_hint}', font=f7, fill=(180, 180, 180))
-    draw.text((4, 92), f'Up: {h:02d}:{m:02d}:{s:02d}', font=f8b, fill=uptime_col)
-    draw.line([(0, 104), (128, 104)], fill=(50, 50, 50))
-    draw.text((4, 107), 'KEY1/2/3 = stop stream', font=f7, fill=(130, 130, 130))
+    cam_lbl = f'{cam_name}  key:{key_hint}' if cam_name else f'key:{key_hint}'
+    draw.text((4, 81), cam_lbl[:22],                          font=f7, fill=(180, 180, 180))
+    draw.text((4, 91), f'\u266a {station_name[:18]}',         font=f7, fill=(100, 180, 100))
+    draw.text((4, 101), f'Up: {h:02d}:{m:02d}:{s:02d}',      font=f8b, fill=uptime_col)
+    draw.line([(0, 112), (128, 112)], fill=(50, 50, 50))
+    draw.text((4, 115), 'KEY1/2/3 = stop', font=f7, fill=(130, 130, 130))
 
     lcd.LCD_ShowImage(img, 0, 0)
 
@@ -1403,49 +1490,128 @@ def launch_youtube_stream(lcd):
         os.execv(sys.executable, [sys.executable] + sys.argv)
         return
 
+    # ── Camera selection menu ─────────────────────────────────────────────────
+    cam_idx       = 0
+    ju_was = jd_was = jp_was = False
+    cam_confirmed = False
+    while True:
+        _draw_youtube_camera_menu(lcd, cam_idx)
+        time.sleep(0.05)
+        ju = GPIO.input(JOYSTICK_UP)    == GPIO.LOW
+        jd = GPIO.input(JOYSTICK_DOWN)  == GPIO.LOW
+        jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
+        k1 = GPIO.input(KEY1_PIN)       == GPIO.LOW
+        k2 = GPIO.input(KEY2_PIN)       == GPIO.LOW
+        k3 = GPIO.input(KEY3_PIN)       == GPIO.LOW
+        if ju and not ju_was:
+            cam_idx = (cam_idx - 1) % len(_YT_CAMERAS)
+        if jd and not jd_was:
+            cam_idx = (cam_idx + 1) % len(_YT_CAMERAS)
+        if jp and not jp_was:
+            cam_confirmed = True
+            break
+        if k1 or k2 or k3:
+            break
+        ju_was, jd_was, jp_was = ju, jd, jp
+
+    if not cam_confirmed:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
+
+    cam          = _YT_CAMERAS[cam_idx]
+    otr_url      = cfg.get('otr_station_url', _OTR_DEFAULT).strip() or _OTR_DEFAULT
+    station_name = _otr_name_for_url(otr_url)
+
     _set_mode('youtube_stream')
     _stop_event.clear()
 
     key_hint = f'****{stream_key[-4:]}' if len(stream_key) >= 4 else '****'
     rtmp_url  = f'{_YT_RTMP_BASE}/{stream_key}'
 
-    # Grab an initial snapshot with fswebcam (more reliable than ffmpeg MJPEG for this camera)
+    # ── Snapshot ──────────────────────────────────────────────────────────────
     snap_loaded = False
-    try:
-        r = subprocess.run(
-            ['fswebcam', '-d', _YT_VIDEO_DEV, '-r', '640x480',
-             '--jpeg', '90', '--skip', '20', '--no-banner', _YT_SNAP_PATH],
-            timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        snap_loaded = (r.returncode == 0 and os.path.exists(_YT_SNAP_PATH))
-    except Exception:
-        pass
+    if cam['type'] == 'usb':
+        try:
+            r = subprocess.run(
+                ['fswebcam', '-d', cam['device'], '-r', '640x480',
+                 '--jpeg', '90', '--skip', '20', '--no-banner', _YT_SNAP_PATH],
+                timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            snap_loaded = (r.returncode == 0 and os.path.exists(_YT_SNAP_PATH))
+        except Exception:
+            pass
+    else:
+        try:
+            r = subprocess.run(
+                ['libcamera-still', '-o', _YT_SNAP_PATH,
+                 '--width', '640', '--height', '480',
+                 '--nopreview', '-t', '1000'],
+                timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            snap_loaded = (r.returncode == 0 and os.path.exists(_YT_SNAP_PATH))
+        except Exception:
+            pass
 
-    # Single ffmpeg process streaming to YouTube.
-    # H264 native input → re-encode with brightness boost → RTMP.
-    # No split/thumbnail in ffmpeg (fps=1/120 buffers too many frames on Pi).
-    ffmpeg_cmd = [
-        'ffmpeg',
-        '-f', 'v4l2', '-input_format', 'h264',
-        '-video_size', '1280x720', '-framerate', '30',
-        '-i', _YT_VIDEO_DEV,
-        '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
-        '-vf', 'eq=brightness=0.15:contrast=1.5:gamma=1.5',
-        '-map', '0:v', '-map', '1:a',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
-        '-pix_fmt', 'yuv420p', '-g', '60',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-f', 'flv', rtmp_url,
-    ]
+    # ── Build ffmpeg + optional libcamera-vid commands ────────────────────────
+    w, h, fps = cam['width'], cam['height'], cam['fps']
+
+    if cam['type'] == 'usb':
+        libcam_cmd = None
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-f', 'v4l2', '-input_format', 'h264',
+            '-video_size', f'{w}x{h}', '-framerate', str(fps),
+            '-i', cam['device'],
+            '-i', otr_url,
+            '-vf', 'eq=brightness=0.15:contrast=1.5:gamma=1.5',
+            '-map', '0:v', '-map', '1:a',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
+            '-pix_fmt', 'yuv420p', '-g', str(fps * 2),
+            '-c:a', 'aac', '-b:a', '128k',
+            '-f', 'flv', rtmp_url,
+        ]
+    else:  # csi — libcamera-vid hardware encoder piped into ffmpeg
+        libcam_cmd = [
+            'libcamera-vid', '-t', '0',
+            '--codec', 'h264',
+            '--profile', 'high', '--level', '4.1',
+            '--width',  str(w), '--height', str(h),
+            '--framerate', str(fps),
+            '--bitrate', '2500000',
+            '--intra', str(fps * 2),
+            '--inline', '--nopreview',
+            '-o', '-',
+        ]
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-f', 'h264', '-i', 'pipe:0',
+            '-i', otr_url,
+            '-map', '0:v', '-map', '1:a',
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-f', 'flv', rtmp_url,
+        ]
 
     def _start_stream():
-        return subprocess.Popen(
+        if libcam_cmd:
+            lc = subprocess.Popen(
+                libcam_cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            ff = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=lc.stdout,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            lc.stdout.close()  # transfer pipe ownership to ffmpeg
+            return lc, ff
+        return None, subprocess.Popen(
             ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
-    stream_proc = _start_stream()
-    _push_event('YT', f'\u25b6 YouTube stream started \u2192 {key_hint}')
+    libcam_proc, stream_proc = _start_stream()
+    _push_event('YT', f'\u25b6 Stream \u2192 {cam["short"]} / {station_name[:12]}')
 
     start_time  = time.monotonic()
     k1w = k2w = k3w = False
@@ -1456,16 +1622,19 @@ def launch_youtube_stream(lcd):
     while not stopped:
         uptime_s = int(time.monotonic() - start_time)
         is_live  = stream_proc.poll() is None
-        _draw_youtube_live_screen(lcd, is_live, uptime_s, key_hint,
-                                  snap_loaded or os.path.exists(_YT_SNAP_PATH))
+        _draw_youtube_live_screen(
+            lcd, is_live, uptime_s, key_hint,
+            snap_loaded or os.path.exists(_YT_SNAP_PATH),
+            cam_name=cam['short'], station_name=station_name,
+        )
 
-        # ffmpeg died — auto-reconnect unless user stopped or too many retries
         if not is_live and not _stop_event.is_set():
             retries += 1
             if retries <= MAX_RETRIES:
                 _push_event('YT', f'\u26a0 Connection lost — retry {retries}/{MAX_RETRIES}')
+                _terminate_proc(libcam_proc)
                 time.sleep(5)
-                stream_proc = _start_stream()
+                libcam_proc, stream_proc = _start_stream()
                 continue
             else:
                 _push_event('YT', f'\u25a0 Stream failed after {MAX_RETRIES} retries')
@@ -1500,6 +1669,7 @@ def launch_youtube_stream(lcd):
 
         time.sleep(2)
 
+    _terminate_proc(libcam_proc)
     _terminate_proc(stream_proc)
     _push_event('YT', '\u25a0 YouTube stream stopped')
     _set_mode('idle')
