@@ -1576,8 +1576,9 @@ def _draw_youtube_camera_menu(lcd, selected_idx):
         draw.text((5,  y0 + 2),  prefix + name, font=f8, fill=(255, 255, 255))
         draw.text((14, y0 + 12), sub,            font=f7, fill=(160, 160, 160))
     draw.line([(0, 109), (128, 109)], fill=(50, 50, 50))
-    draw.text((4, 112), 'JOY\u2191\u2193=sel  \u25cf=go  K=back', font=f7,
+    draw.text((4, 111), '\u2191\u2193=sel  \u25cf=LIVE  \u2192=Setup', font=f7,
               fill=(130, 130, 130))
+    draw.text((4, 120), 'K1/K2/K3 = cancel', font=f7, fill=(90, 90, 90))
     lcd.LCD_ShowImage(img, 0, 0)
 
 
@@ -1642,14 +1643,16 @@ def launch_youtube_stream(lcd):
 
     # ── Camera selection menu ─────────────────────────────────────────────────
     cam_idx       = 0
-    ju_was = jd_was = jp_was = False
+    ju_was = jd_was = jp_was = jr_was = False
     cam_confirmed = False
+    align_mode    = False
     while True:
         _draw_youtube_camera_menu(lcd, cam_idx)
         time.sleep(0.05)
         ju = GPIO.input(JOYSTICK_UP)    == GPIO.LOW
         jd = GPIO.input(JOYSTICK_DOWN)  == GPIO.LOW
         jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
+        jr = GPIO.input(JOYSTICK_RIGHT) == GPIO.LOW
         k1 = GPIO.input(KEY1_PIN)       == GPIO.LOW
         k2 = GPIO.input(KEY2_PIN)       == GPIO.LOW
         k3 = GPIO.input(KEY3_PIN)       == GPIO.LOW
@@ -1658,11 +1661,16 @@ def launch_youtube_stream(lcd):
         if jd and not jd_was:
             cam_idx = (cam_idx + 1) % len(_YT_CAMERAS)
         if jp and not jp_was:
-            cam_confirmed = True
+            cam_confirmed = True          # JOY● → fast path: snap + go live
+            align_mode    = False
+            break
+        if jr and not jr_was:
+            cam_confirmed = True          # JOY→ → setup path: alignment mode first
+            align_mode    = True
             break
         if k1 or k2 or k3:
             break
-        ju_was, jd_was, jp_was = ju, jd, jp
+        ju_was, jd_was, jp_was, jr_was = ju, jd, jp, jr
 
     if not cam_confirmed:
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1672,49 +1680,54 @@ def launch_youtube_stream(lcd):
     otr_url      = cfg.get('otr_station_url', _OTR_DEFAULT).strip() or _OTR_DEFAULT
     station_name = _otr_name_for_url(otr_url)
 
-    # ── Pre-stream alignment mode ──────────────────────────────────────────────
+    # ── Pre-stream alignment mode (JOY→ path only) ────────────────────────────
     global _align_cam
     _align_cam  = cam
     snap_loaded = _take_snapshot(cam)
     snap_mtime  = os.path.getmtime(_YT_SNAP_PATH) if os.path.exists(_YT_SNAP_PATH) else 0
 
-    align_done      = False
-    k1w = k2w = k3w = jp_was = False
-    while True:
-        _draw_align_screen(lcd, snap_loaded, cam['short'])
-        time.sleep(0.1)
+    if align_mode:
+        # Full setup loop — browser accessible, K1 retakes snap, JOY● goes live
+        align_done  = False
+        k1w = k2w = k3w = jp_was = False
+        while True:
+            _draw_align_screen(lcd, snap_loaded, cam['short'])
+            time.sleep(0.1)
 
-        # HTTP /snap handler may have refreshed the file from another thread
-        try:
-            mt = os.path.getmtime(_YT_SNAP_PATH)
-            if mt != snap_mtime:
-                snap_mtime  = mt
-                snap_loaded = True
-        except Exception:
-            pass
-
-        k1 = GPIO.input(KEY1_PIN)       == GPIO.LOW
-        k2 = GPIO.input(KEY2_PIN)       == GPIO.LOW
-        k3 = GPIO.input(KEY3_PIN)       == GPIO.LOW
-        jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
-
-        if k1 and not k1w:
-            snap_loaded = _take_snapshot(cam)
+            # HTTP /snap handler may have refreshed the file from another thread
             try:
-                snap_mtime = os.path.getmtime(_YT_SNAP_PATH)
+                mt = os.path.getmtime(_YT_SNAP_PATH)
+                if mt != snap_mtime:
+                    snap_mtime  = mt
+                    snap_loaded = True
             except Exception:
                 pass
-        if jp and not jp_was:
-            align_done = True
-            break
-        if (k2 and not k2w) or (k3 and not k3w):
-            break
-        k1w, k2w, k3w, jp_was = k1, k2, k3, jp
 
-    _align_cam = None
-    if not align_done:
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-        return
+            k1 = GPIO.input(KEY1_PIN)       == GPIO.LOW
+            k2 = GPIO.input(KEY2_PIN)       == GPIO.LOW
+            k3 = GPIO.input(KEY3_PIN)       == GPIO.LOW
+            jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
+
+            if k1 and not k1w:
+                snap_loaded = _take_snapshot(cam)
+                try:
+                    snap_mtime = os.path.getmtime(_YT_SNAP_PATH)
+                except Exception:
+                    pass
+            if jp and not jp_was:
+                align_done = True
+                break
+            if (k2 and not k2w) or (k3 and not k3w):
+                break
+            k1w, k2w, k3w, jp_was = k1, k2, k3, jp
+
+        _align_cam = None
+        if not align_done:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+            return
+    else:
+        # Fast path — snapshot already taken above, clear global and go live
+        _align_cam = None
 
     _set_mode('youtube_stream')
     _stop_event.clear()
