@@ -240,6 +240,7 @@ _bc_wifi_ap_count = 0                # updated by bettercap polling
 _bc_snapshot_lock = threading.Lock()
 _cpu_snapshot    = None              # (idle_ticks, total_ticks) for delta CPU%
 _loot_seen       = {}                # path → mtime, tracks RaspyJack loot changes
+_align_cam       = None              # set while alignment mode is active; used by /snap HTTP handler
 
 
 def _empty_bc_snapshot():
@@ -296,11 +297,103 @@ class _CYDHandler(BaseHTTPRequestHandler):
             self.send_response(200); self._cors(); self.send_header('Content-Length', len(payload)); self.end_headers()
             self.wfile.write(payload)
 
+        elif self.path.startswith('/snap.jpg'):
+            # Serve the snapshot with a rule-of-thirds overlay drawn on top
+            if not os.path.exists(_YT_SNAP_PATH):
+                self.send_response(404); self.end_headers(); return
+            try:
+                img  = Image.open(_YT_SNAP_PATH).convert('RGB')
+                draw = ImageDraw.Draw(img)
+                w, h = img.size
+                for x in (w // 3, 2 * w // 3):
+                    draw.line([(x, 0), (x, h)], fill=(255, 255, 80), width=2)
+                for y in (h // 3, 2 * h // 3):
+                    draw.line([(0, y), (w, y)], fill=(255, 255, 80), width=2)
+                import io
+                buf = io.BytesIO()
+                img.save(buf, format='JPEG', quality=85)
+                data = buf.getvalue()
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(500); self.end_headers()
+
+        elif self.path == '/align':
+            cam   = _align_cam
+            cname = cam['name'] if cam else 'No camera selected'
+            cmode = 'Press K1 on Pi or click Refresh Snapshot to update.'
+            html  = f"""<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Camera Alignment \u2014 RaspyJackProbe</title>
+<style>
+body{{background:#111;color:#eee;font-family:monospace;text-align:center;padding:14px;margin:0}}
+h2{{color:#0af;margin:0 0 6px 0}}
+.info{{color:#888;font-size:12px;margin-bottom:10px}}
+img{{max-width:100%;width:640px;border:2px solid #333;display:block;margin:0 auto 10px auto;border-radius:4px}}
+button{{padding:11px 22px;background:#0a6;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;margin:4px}}
+.status{{font-size:12px;color:#0af;min-height:16px;margin:6px 0}}
+.hint{{font-size:11px;color:#555;margin-top:10px;line-height:1.5}}
+</style></head><body>
+<h2>\u25ce Camera Alignment</h2>
+<div class="info">Camera: <b style="color:#fff">{cname}</b> &nbsp;|&nbsp; {cmode}</div>
+<img id="snap" src="/snap.jpg?t=0" alt="Camera preview">
+<div class="status" id="status">Auto-refreshing every 3 s</div>
+<button onclick="refreshSnap()">\ud83d\udcf7 Refresh Snapshot</button>
+<div class="hint">
+  Yellow lines = rule-of-thirds guide.<br>
+  Press <b>JOY \u25cf</b> on the Pi to go live once framing looks good.<br>
+  Press <b>K2/K3</b> on the Pi to cancel back to the camera menu.
+</div>
+<script>
+let autoTimer = setInterval(autoRefresh, 3000);
+function stamp(){{ return '?t=' + Date.now(); }}
+function autoRefresh(){{ document.getElementById('snap').src = '/snap.jpg' + stamp(); }}
+function refreshSnap() {{
+  const st = document.getElementById('status');
+  st.textContent = 'Taking snapshot\u2026';
+  clearInterval(autoTimer);
+  fetch('/snap', {{method:'POST'}}).then(() => {{
+    setTimeout(() => {{
+      document.getElementById('snap').src = '/snap.jpg' + stamp();
+      st.textContent = 'Auto-refreshing every 3 s';
+      autoTimer = setInterval(autoRefresh, 3000);
+    }}, 1500);
+  }}).catch(() => {{
+    st.textContent = 'Snap failed \u2014 check Pi connection';
+    autoTimer = setInterval(autoRefresh, 3000);
+  }});
+}}
+</script></body></html>""".encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+
         else:
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        if self.path == '/cmd':
+        if self.path == '/snap':
+            # Retake snapshot from the current alignment camera
+            cam = _align_cam
+            if cam:
+                _take_snapshot(cam)
+                resp = json.dumps({'ok': True}).encode()
+                self.send_response(200)
+            else:
+                resp = json.dumps({'ok': False, 'error': 'not in alignment mode'}).encode()
+                self.send_response(409)
+            self._cors()
+            self.send_header('Content-Length', len(resp))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        elif self.path == '/cmd':
             length = int(self.headers.get('Content-Length', 0))
             body   = self.rfile.read(length)
             try:
@@ -1404,6 +1497,63 @@ def _draw_youtube_nokey_screen(lcd):
     lcd.LCD_ShowImage(img, 0, 0)
 
 
+def _take_snapshot(cam):
+    """Capture one frame from cam to _YT_SNAP_PATH. Returns True on success."""
+    if cam['type'] == 'usb':
+        try:
+            r = subprocess.run(
+                ['fswebcam', '-d', cam['device'], '-r', '640x480',
+                 '--jpeg', '90', '--skip', '20', '--no-banner', _YT_SNAP_PATH],
+                timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return r.returncode == 0 and os.path.exists(_YT_SNAP_PATH)
+        except Exception:
+            return False
+    else:
+        try:
+            r = subprocess.run(
+                ['libcamera-still', '-o', _YT_SNAP_PATH,
+                 '--width', '640', '--height', '480',
+                 '--nopreview', '-t', '1000'],
+                timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return r.returncode == 0 and os.path.exists(_YT_SNAP_PATH)
+        except Exception:
+            return False
+
+
+def _draw_align_screen(lcd, snap_loaded, cam_name):
+    img  = Image.new('RGB', (128, 128), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    f8b  = _font(_FONT_PATH_BOLD, 8)
+    f7   = _font(_FONT_PATH, 7)
+
+    # Paste snapshot into preview area (y=14 to y=104)
+    if snap_loaded and os.path.exists(_YT_SNAP_PATH):
+        try:
+            snap = Image.open(_YT_SNAP_PATH).resize((128, 90))
+            img.paste(snap, (0, 14))
+        except Exception:
+            pass
+
+    draw.rectangle([(0, 0), (128, 14)], fill=(0, 100, 160))
+    draw.text((4, 3), f'\u25ce ALIGN  {cam_name}', font=f8b, fill=(255, 255, 255))
+
+    # Rule-of-thirds guide lines over preview area
+    for x in (43, 85):
+        draw.line([(x, 14), (x, 104)], fill=(255, 255, 80), width=1)
+    for y in (44, 74):
+        draw.line([(0, y), (128, y)], fill=(255, 255, 80), width=1)
+
+    draw.rectangle([(0, 104), (128, 128)], fill=(0, 0, 0))
+    draw.line([(0, 104), (128, 104)], fill=(50, 50, 50))
+    draw.text((4,  107), 'K1=snap', font=f7, fill=(200, 200, 0))
+    draw.text((50, 107), '\u25cf=LIVE', font=f7, fill=(80, 255, 80))
+    draw.text((90, 107), 'K2=back', font=f7, fill=(160, 80, 80))
+    draw.text((4,  118), ':9090/align \u2192 browser', font=f7, fill=(70, 140, 200))
+    lcd.LCD_ShowImage(img, 0, 0)
+
+
 def _draw_youtube_camera_menu(lcd, selected_idx):
     img  = Image.new('RGB', (128, 128), (0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -1522,35 +1672,55 @@ def launch_youtube_stream(lcd):
     otr_url      = cfg.get('otr_station_url', _OTR_DEFAULT).strip() or _OTR_DEFAULT
     station_name = _otr_name_for_url(otr_url)
 
+    # ── Pre-stream alignment mode ──────────────────────────────────────────────
+    global _align_cam
+    _align_cam  = cam
+    snap_loaded = _take_snapshot(cam)
+    snap_mtime  = os.path.getmtime(_YT_SNAP_PATH) if os.path.exists(_YT_SNAP_PATH) else 0
+
+    align_done      = False
+    k1w = k2w = k3w = jp_was = False
+    while True:
+        _draw_align_screen(lcd, snap_loaded, cam['short'])
+        time.sleep(0.1)
+
+        # HTTP /snap handler may have refreshed the file from another thread
+        try:
+            mt = os.path.getmtime(_YT_SNAP_PATH)
+            if mt != snap_mtime:
+                snap_mtime  = mt
+                snap_loaded = True
+        except Exception:
+            pass
+
+        k1 = GPIO.input(KEY1_PIN)       == GPIO.LOW
+        k2 = GPIO.input(KEY2_PIN)       == GPIO.LOW
+        k3 = GPIO.input(KEY3_PIN)       == GPIO.LOW
+        jp = GPIO.input(JOYSTICK_PRESS) == GPIO.LOW
+
+        if k1 and not k1w:
+            snap_loaded = _take_snapshot(cam)
+            try:
+                snap_mtime = os.path.getmtime(_YT_SNAP_PATH)
+            except Exception:
+                pass
+        if jp and not jp_was:
+            align_done = True
+            break
+        if (k2 and not k2w) or (k3 and not k3w):
+            break
+        k1w, k2w, k3w, jp_was = k1, k2, k3, jp
+
+    _align_cam = None
+    if not align_done:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+        return
+
     _set_mode('youtube_stream')
     _stop_event.clear()
 
     key_hint = f'****{stream_key[-4:]}' if len(stream_key) >= 4 else '****'
     rtmp_url  = f'{_YT_RTMP_BASE}/{stream_key}'
-
-    # ── Snapshot ──────────────────────────────────────────────────────────────
-    snap_loaded = False
-    if cam['type'] == 'usb':
-        try:
-            r = subprocess.run(
-                ['fswebcam', '-d', cam['device'], '-r', '640x480',
-                 '--jpeg', '90', '--skip', '20', '--no-banner', _YT_SNAP_PATH],
-                timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            snap_loaded = (r.returncode == 0 and os.path.exists(_YT_SNAP_PATH))
-        except Exception:
-            pass
-    else:
-        try:
-            r = subprocess.run(
-                ['libcamera-still', '-o', _YT_SNAP_PATH,
-                 '--width', '640', '--height', '480',
-                 '--nopreview', '-t', '1000'],
-                timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            snap_loaded = (r.returncode == 0 and os.path.exists(_YT_SNAP_PATH))
-        except Exception:
-            pass
 
     # ── Build ffmpeg + optional libcamera-vid commands ────────────────────────
     w, h, fps = cam['width'], cam['height'], cam['fps']
