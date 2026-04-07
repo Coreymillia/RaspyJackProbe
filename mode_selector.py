@@ -1783,8 +1783,8 @@ def launch_youtube_stream(lcd):
             *audio_args,
             '-map', '0:v', '-map', '1:a',
             '-c:v', 'copy',
-            '-b:v', '500k',
-            '-c:a', 'aac', '-b:a', '64k',
+            '-b:v', '1500k',
+            '-c:a', 'aac', '-b:a', '128k',
             '-f', 'flv', rtmp_url,
         ]
     else:  # csi — rpicam-vid hardware encoder piped into ffmpeg
