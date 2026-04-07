@@ -1767,18 +1767,23 @@ def launch_youtube_stream(lcd):
             audio_args = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
         else:
             audio_args = ['-i', otr_url]
-        # MJPEG input: each frame is self-contained — avoids the frozen-frame
-        # issue caused by v4l2 H264 NAL fragmentation on USB cameras.
+        # H264 passthrough: camera encodes H264 natively; Pi just relays it.
+        # Force a keyframe every 2s via v4l2-ctl so YouTube doesn't stall.
+        # Re-encoding (MJPEG or H264→libx264) exceeds Pi Zero 2W CPU budget.
+        subprocess.run(
+            ['v4l2-ctl', '-d', cam['device'],
+             '--set-ctrl=h264_i_frame_period=60'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
         ffmpeg_cmd = [
             'ffmpeg',
-            '-f', 'v4l2', '-input_format', 'mjpeg',
+            '-f', 'v4l2', '-input_format', 'h264',
             '-video_size', f'{w}x{h}', '-framerate', str(fps),
             '-i', cam['device'],
             *audio_args,
             '-map', '0:v', '-map', '1:a',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-            '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
-            '-pix_fmt', 'yuv420p', '-g', str(fps * 2),
+            '-c:v', 'copy',
+            '-b:v', '2500k',
             '-c:a', 'aac', '-b:a', '128k',
             '-f', 'flv', rtmp_url,
         ]
