@@ -1466,7 +1466,7 @@ def _otr_name_for_url(url):
 # type 'csi' → rpicam-vid H264 pipe into ffmpeg (ribbon CSI cameras, Bookworm)
 _YT_CAMERAS = [
     {'name': 'USB Microscope', 'short': 'USB-CAM',
-     'type': 'usb', 'device': '/dev/video0', 'audio': 'silent',
+     'type': 'usb', 'device': None, 'audio': 'silent',
      'width': 1280, 'height': 720,  'fps': 30},
     {'name': 'Arducam CSI',    'short': 'ARDUCAM',
      'type': 'csi', 'audio': 'otr',
@@ -1478,6 +1478,26 @@ _YT_CAMERAS = [
      'type': 'csi', 'audio': 'otr',
      'width': 1920, 'height': 1080, 'fps': 30},
 ]
+
+
+def _find_usb_video_device():
+    """Return the first /dev/videoN whose bus info contains 'usb' (case-insensitive).
+    Falls back to /dev/video0 if nothing found."""
+    try:
+        import glob as _glob
+        for dev in sorted(_glob.glob('/dev/video*')):
+            try:
+                out = subprocess.check_output(
+                    ['v4l2-ctl', '-d', dev, '--info'],
+                    stderr=subprocess.DEVNULL, text=True, timeout=2
+                )
+                if 'usb' in out.lower():
+                    return dev
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return '/dev/video0'
 
 
 def _draw_youtube_nokey_screen(lcd):
@@ -1677,6 +1697,9 @@ def launch_youtube_stream(lcd):
         return
 
     cam          = _YT_CAMERAS[cam_idx]
+    # Resolve USB device dynamically so it works regardless of CSI/USB ordering
+    if cam['type'] == 'usb':
+        cam = dict(cam, device=_find_usb_video_device())
     otr_url      = cfg.get('otr_station_url', _OTR_DEFAULT).strip() or _OTR_DEFAULT
     station_name = _otr_name_for_url(otr_url)
 
