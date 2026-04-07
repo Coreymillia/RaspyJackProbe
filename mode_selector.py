@@ -1466,16 +1466,16 @@ def _otr_name_for_url(url):
 # type 'csi' → rpicam-vid H264 pipe into ffmpeg (ribbon CSI cameras, Bookworm)
 _YT_CAMERAS = [
     {'name': 'USB Microscope', 'short': 'USB-CAM',
-     'type': 'usb', 'device': '/dev/video0',
+     'type': 'usb', 'device': '/dev/video0', 'audio': 'silent',
      'width': 1280, 'height': 720,  'fps': 30},
     {'name': 'Arducam CSI',    'short': 'ARDUCAM',
-     'type': 'csi',
+     'type': 'csi', 'audio': 'otr',
      'width': 1280, 'height': 720,  'fps': 30},
     {'name': 'Pi Camera v2.1', 'short': 'PI-CAM',
-     'type': 'csi',
+     'type': 'csi', 'audio': 'otr',
      'width': 1280, 'height': 720,  'fps': 30},
     {'name': 'HQ Camera',      'short': 'HQ-CAM',
-     'type': 'csi',
+     'type': 'csi', 'audio': 'otr',
      'width': 1920, 'height': 1080, 'fps': 30},
 ]
 
@@ -1740,12 +1740,16 @@ def launch_youtube_stream(lcd):
 
     if cam['type'] == 'usb':
         libcam_cmd = None
+        if cam.get('audio') == 'silent':
+            audio_args = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
+        else:
+            audio_args = ['-i', otr_url]
         ffmpeg_cmd = [
             'ffmpeg',
             '-f', 'v4l2', '-input_format', 'h264',
             '-video_size', f'{w}x{h}', '-framerate', str(fps),
             '-i', cam['device'],
-            '-i', otr_url,
+            *audio_args,
             '-vf', 'eq=brightness=0.15:contrast=1.5:gamma=1.5',
             '-map', '0:v', '-map', '1:a',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
