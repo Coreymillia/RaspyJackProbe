@@ -342,7 +342,7 @@ button{{padding:11px 22px;background:#0a6;color:#fff;border:none;border-radius:6
 <div class="info">Camera: <b style="color:#fff">{cname}</b> &nbsp;|&nbsp; {cmode}</div>
 <img id="snap" src="/snap.jpg?t=0" alt="Camera preview">
 <div class="status" id="status">Auto-refreshing every 3 s</div>
-<button onclick="refreshSnap()">\ud83d\udcf7 Refresh Snapshot</button>
+<button onclick="refreshSnap()">&#128247; Refresh Snapshot</button>
 <div class="hint">
   Yellow lines = rule-of-thirds guide.<br>
   Press <b>JOY \u25cf</b> on the Pi to go live once framing looks good.<br>
@@ -1463,7 +1463,7 @@ def _otr_name_for_url(url):
 
 # ── Camera profiles ────────────────────────────────────────────────────────────
 # type 'usb' → v4l2 H264 device input (USB microscope, existing hardware)
-# type 'csi' → libcamera-vid H264 pipe into ffmpeg (ribbon CSI cameras)
+# type 'csi' → rpicam-vid H264 pipe into ffmpeg (ribbon CSI cameras, Bookworm)
 _YT_CAMERAS = [
     {'name': 'USB Microscope', 'short': 'USB-CAM',
      'type': 'usb', 'device': '/dev/video0',
@@ -1512,7 +1512,7 @@ def _take_snapshot(cam):
     else:
         try:
             r = subprocess.run(
-                ['libcamera-still', '-o', _YT_SNAP_PATH,
+                ['rpicam-still', '-o', _YT_SNAP_PATH,
                  '--width', '640', '--height', '480',
                  '--nopreview', '-t', '1000'],
                 timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -1754,9 +1754,9 @@ def launch_youtube_stream(lcd):
             '-c:a', 'aac', '-b:a', '128k',
             '-f', 'flv', rtmp_url,
         ]
-    else:  # csi — libcamera-vid hardware encoder piped into ffmpeg
+    else:  # csi — rpicam-vid hardware encoder piped into ffmpeg
         libcam_cmd = [
-            'libcamera-vid', '-t', '0',
+            'rpicam-vid', '-t', '0',
             '--codec', 'h264',
             '--profile', 'high', '--level', '4.1',
             '--width',  str(w), '--height', str(h),
