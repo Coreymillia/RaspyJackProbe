@@ -1767,13 +1767,14 @@ def launch_youtube_stream(lcd):
             audio_args = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
         else:
             audio_args = ['-i', otr_url]
+        # MJPEG input: each frame is self-contained — avoids the frozen-frame
+        # issue caused by v4l2 H264 NAL fragmentation on USB cameras.
         ffmpeg_cmd = [
             'ffmpeg',
-            '-f', 'v4l2', '-input_format', 'h264',
+            '-f', 'v4l2', '-input_format', 'mjpeg',
             '-video_size', f'{w}x{h}', '-framerate', str(fps),
             '-i', cam['device'],
             *audio_args,
-            '-vf', 'eq=brightness=0.15:contrast=1.5:gamma=1.5',
             '-map', '0:v', '-map', '1:a',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
             '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
