@@ -231,8 +231,9 @@ Before streaming:
 How it works:
 
 - Grabs a thumbnail snapshot from the camera and displays it on the Pi LCD before starting
-- Captures H264 video from the USB camera at 720p30 using `v4l2`
-- Re-encodes with `libx264` (ultrafast / zerolatency preset) and injects silent AAC audio to satisfy YouTube's audio track requirement
+- Captures MJPEG video from the USB camera at 640x480 and 10 fps using `v4l2`
+- Re-encodes with `libx264` (ultrafast / zerolatency preset) at a lighter bitrate for Wi-Fi use
+- Uses either silent AAC or the selected OTR station from the Settings Portal for the stream audio track
 - Applies a brightness/contrast boost (`eq=brightness=0.15:contrast=1.5:gamma=1.5`) to improve visibility in low-light conditions
 - Auto-reconnects up to 5 times if the stream drops
 

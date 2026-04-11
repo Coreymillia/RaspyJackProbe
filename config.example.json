@@ -12,7 +12,7 @@
     "anomaly_poll_interval": 30,
     "anomaly_spike_threshold": 3,
 
-    "_youtube_comment": "YouTube RTMP stream key (from YouTube Studio → Go Live). otr_station_url sets the live radio audio overlaid on the stream — defaults to 1940s Radio if blank.",
+    "_youtube_comment": "YouTube live settings. Configure in the settings portal at :8090. otr_station_url can be '__silent__' for silent AAC or one of the built-in station URLs.",
     "youtube_stream_key": "",
-    "otr_station_url": "http://149.255.60.195:8256/stream"
+    "otr_station_url": "__silent__"
 }

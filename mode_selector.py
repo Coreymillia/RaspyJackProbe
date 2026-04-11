@@ -541,6 +541,10 @@ def _settings_html(cfg):
     current_otr = cfg.get('otr_station_url', _OTR_DEFAULT) or _OTR_DEFAULT
     otr_opts = ''
     matched = False
+    sel = ' selected' if current_otr == _OTR_SILENT else ''
+    if sel:
+        matched = True
+    otr_opts += f'<option value="{_OTR_SILENT}"{sel}>Silent AAC</option>\n'
     for sname, surl in _OTR_STATIONS:
         sel = ' selected' if surl == current_otr else ''
         if sel:
@@ -603,7 +607,7 @@ button{{margin-top:24px;width:100%;padding:12px;background:#0a6;color:#fff;borde
 <label>OTR Audio Station</label>
 <select name="otr_station_url" style="width:100%;background:#222;color:#fff;border:1px solid #444;padding:6px;border-radius:4px;font-family:monospace;font-size:13px">
 {otr_opts}</select>
-<div class="hint">Live audio overlaid on stream &mdash; ROKiT Radio Network OTR streams. Default: 1940s Radio.</div>
+<div class="hint">Choose Silent AAC or one of the OTR radio stations for the live stream.</div>
 </div>
 
 <button type="submit">&#128190; Save Config</button>
@@ -1437,6 +1441,7 @@ def launch_wifi_scanner(lcd):
 _YT_SNAP_PATH  = '/tmp/yt_snap.jpg'
 _YT_RTMP_BASE  = 'rtmp://a.rtmp.youtube.com/live2'
 _YT_VIDEO_DEV  = '/dev/video0'
+_OTR_SILENT    = '__silent__'
 
 # ── OTR radio stations (ROKiT Radio Network, 48 kbps MP3 HTTP streams) ────────
 _OTR_STATIONS = [
@@ -1453,9 +1458,11 @@ _OTR_STATIONS = [
     ('Nostalgia Lane',    'http://149.255.60.195:8180/stream'),
     ('Science Fiction',   'http://149.255.60.194:8110/stream'),
 ]
-_OTR_DEFAULT = 'http://149.255.60.195:8256/stream'  # 1940s Radio
+_OTR_DEFAULT = _OTR_SILENT
 
 def _otr_name_for_url(url):
+    if url == _OTR_SILENT:
+        return 'Silent AAC'
     for name, u in _OTR_STATIONS:
         if u == url:
             return name
@@ -1466,8 +1473,8 @@ def _otr_name_for_url(url):
 # type 'csi' → rpicam-vid H264 pipe into ffmpeg (ribbon CSI cameras, Bookworm)
 _YT_CAMERAS = [
     {'name': 'USB Microscope', 'short': 'USB-CAM',
-     'type': 'usb', 'device': None, 'audio': 'silent',
-     'width': 1280, 'height': 720,  'fps': 30},
+     'type': 'usb', 'device': None, 'audio': 'otr',
+     'width': 640, 'height': 480,  'fps': 10},
     {'name': 'Arducam CSI',    'short': 'ARDUCAM',
      'type': 'csi', 'audio': 'otr',
      'width': 1280, 'height': 720,  'fps': 30},
@@ -1583,7 +1590,7 @@ def _draw_youtube_camera_menu(lcd, selected_idx):
     draw.rectangle([(0, 0), (128, 14)], fill=(180, 20, 20))
     draw.text((4, 3), '\u25b6 SELECT CAMERA', font=f8b, fill=(255, 255, 255))
     labels = [
-        ('USB Microscope', '720p30 \u00b7 USB'),
+        ('USB Microscope', '480p10 \u00b7 USB'),
         ('Arducam CSI',    '720p30 \u00b7 Ribbon'),
         ('Pi Camera v2.1', '720p30 \u00b7 CSI'),
         ('HQ Camera',      '1080p30 \u00b7 CSI'),
@@ -1760,31 +1767,26 @@ def launch_youtube_stream(lcd):
 
     # ── Build ffmpeg + optional libcamera-vid commands ────────────────────────
     w, h, fps = cam['width'], cam['height'], cam['fps']
+    if otr_url == _OTR_SILENT:
+        audio_args = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
+    else:
+        audio_args = ['-i', otr_url]
 
     if cam['type'] == 'usb':
         libcam_cmd = None
-        if cam.get('audio') == 'silent':
-            audio_args = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
-        else:
-            audio_args = ['-i', otr_url]
-        # H264 passthrough: camera encodes H264 natively; Pi just relays it.
-        # Force a keyframe every 2s via v4l2-ctl so YouTube doesn't stall.
-        # Re-encoding (MJPEG or H264→libx264) exceeds Pi Zero 2W CPU budget.
-        subprocess.run(
-            ['v4l2-ctl', '-d', cam['device'],
-             '--set-ctrl=h264_i_frame_period=60'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        # MJPEG input: each frame is self-contained — avoids the frozen-frame
+        # issue caused by v4l2 H264 NAL fragmentation on USB cameras.
         ffmpeg_cmd = [
             'ffmpeg',
-            '-f', 'v4l2', '-input_format', 'h264',
+            '-f', 'v4l2', '-input_format', 'mjpeg',
             '-video_size', f'{w}x{h}', '-framerate', str(fps),
             '-i', cam['device'],
             *audio_args,
             '-map', '0:v', '-map', '1:a',
-            '-c:v', 'copy',
-            '-b:v', '1500k',
-            '-c:a', 'aac', '-b:a', '128k',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-b:v', '900k', '-maxrate', '900k', '-bufsize', '1800k',
+            '-pix_fmt', 'yuv420p', '-g', str(fps * 2),
+            '-c:a', 'aac', '-b:a', '64k',
             '-f', 'flv', rtmp_url,
         ]
     else:  # csi — rpicam-vid hardware encoder piped into ffmpeg
@@ -1802,10 +1804,10 @@ def launch_youtube_stream(lcd):
         ffmpeg_cmd = [
             'ffmpeg',
             '-f', 'h264', '-i', 'pipe:0',
-            '-i', otr_url,
+            *audio_args,
             '-map', '0:v', '-map', '1:a',
             '-c:v', 'copy',
-            '-c:a', 'aac', '-b:a', '128k',
+            '-c:a', 'aac', '-b:a', '64k',
             '-f', 'flv', rtmp_url,
         ]
 
